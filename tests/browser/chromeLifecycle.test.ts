@@ -54,7 +54,12 @@ describe("registerTerminationHooks", () => {
     try {
       process.emit("SIGTERM");
       for (let attempt = 0; attempt < 20; attempt += 1) {
-        if (await stat(userDataDir).then(() => false).catch(() => true)) break;
+        if (
+          await stat(userDataDir)
+            .then(() => false)
+            .catch(() => true)
+        )
+          break;
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
 
@@ -104,9 +109,8 @@ describe("registerTerminationHooks", () => {
 
 describe("copied-profile launch flags", () => {
   test("strips mock keychain flags while retaining custom-host launch flags", async () => {
-    const { resolveChromeLaunchOptionsForTest } = await import(
-      "../../src/browser/chromeLifecycle.js"
-    );
+    const { resolveChromeLaunchOptionsForTest } =
+      await import("../../src/browser/chromeLifecycle.js");
     const options = resolveChromeLaunchOptionsForTest(
       ["--use-mock-keychain", "--password-store=basic", "--remote-debugging-address=0.0.0.0"],
       true,
@@ -308,11 +312,7 @@ describe("closeBlankChromeTabs", () => {
         send: (method: string, params: unknown, sessionId: string) => Promise<unknown>;
       }
     ).send("Target.setAutoAttach", { autoAttach: true }, "session-9");
-    expect(send).toHaveBeenCalledWith(
-      "Target.setAutoAttach",
-      { autoAttach: true },
-      "session-9",
-    );
+    expect(send).toHaveBeenCalledWith("Target.setAutoAttach", { autoAttach: true }, "session-9");
   });
 
   test("waits on a single websocket connection attempt for Chrome approval", async () => {
