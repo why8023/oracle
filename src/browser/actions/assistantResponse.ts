@@ -232,19 +232,25 @@ export async function waitForAssistantResponse(
       isStopButtonVisible(Runtime),
       isCompletionVisible(Runtime),
     ]);
-    if (stopVisible) {
-      logger("Assistant still generating; waiting for completion");
+    // Completion controls can appear briefly while Pro is still replacing its thinking UI.
+    // Confirm every capture from that transition with the stability-based watchdog; a
+    // partial first paragraph can be arbitrarily long.
+    const candidateText = String(candidate?.text ?? "").trim();
+    if (stopVisible || completionVisible) {
+      logger(
+        stopVisible
+          ? "Assistant still generating; waiting for completion"
+          : "Completion controls surfaced; confirming stable assistant response",
+      );
       const completed = await pollAssistantCompletion(
         Runtime,
         remainingMs,
         minTurnIndex,
         expectedConversationId,
       );
-      if (completed) {
+      if (completed && String(completed.text ?? "").trim().length >= candidateText.length) {
         return completed;
       }
-    } else if (completionVisible) {
-      // No-op: completion UI surfaced and stop button is gone.
     }
   }
 
