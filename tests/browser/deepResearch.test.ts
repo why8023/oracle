@@ -100,6 +100,29 @@ describe("activateDeepResearch", () => {
     expect(mockLogger).toHaveBeenCalledWith("Deep Research mode already active");
   });
 
+  it("uses a trusted click when the menu item requires real mouse input", async () => {
+    const dispatchMouseEvent = vi.fn(async () => undefined);
+    mockInput = { dispatchMouseEvent };
+    mockRuntime.evaluate
+      .mockResolvedValueOnce({
+        result: { value: { status: "trusted-click-required", clickPoint: { x: 56, y: 78 } } },
+      })
+      .mockResolvedValueOnce({ result: { value: true } });
+
+    await expect(
+      activateDeepResearch(mockRuntime as never, mockInput as never, mockLogger),
+    ).resolves.toBeUndefined();
+    expect(dispatchMouseEvent).toHaveBeenCalledTimes(3);
+    expect(dispatchMouseEvent).toHaveBeenCalledWith({
+      type: "mousePressed",
+      x: 56,
+      y: 78,
+      button: "left",
+      clickCount: 1,
+    });
+    expect(mockLogger).toHaveBeenCalledWith("Deep Research mode activated");
+  });
+
   it("throws when plus button is missing", async () => {
     mockRuntime.evaluate.mockResolvedValueOnce({
       result: { value: { status: "plus-button-missing" } },
@@ -676,6 +699,50 @@ describe("waitForDeepResearchCompletion", () => {
 
     const result = await waitForDeepResearchCompletion(mockRuntime as never, mockLogger, 60_000);
     expect(result.text).toBe("Research report content");
+  });
+
+  it("exports Markdown only after Oracle detects Deep Research completion", async () => {
+    mockRuntime.evaluate.mockResolvedValueOnce({
+      result: {
+        value: {
+          finished: false,
+          stopVisible: true,
+          textLength: 120,
+          hasIframe: true,
+          researchActivity: true,
+        },
+      },
+    });
+    mockRuntime.evaluate.mockResolvedValueOnce({
+      result: {
+        value: { finished: true, stopVisible: false, textLength: 5000, hasIframe: true },
+      },
+    });
+    const captureCompletedMarkdownExport = vi.fn(async () =>
+      [
+        "# Official Deep Research Markdown",
+        "",
+        "## Summary",
+        "",
+        "[Source](https://example.com)",
+      ].join("\n"),
+    );
+
+    const result = await waitForDeepResearchCompletion(
+      mockRuntime as never,
+      mockLogger,
+      60_000,
+      undefined,
+      undefined,
+      undefined,
+      {
+        captureCompletedMarkdownExport,
+      },
+    );
+
+    expect(captureCompletedMarkdownExport).toHaveBeenCalledTimes(1);
+    expect(mockRuntime.evaluate).toHaveBeenCalledTimes(2);
+    expect(result.text).toContain("# Official Deep Research Markdown");
   });
 
   it("detects completion via the Deep Research iframe", async () => {

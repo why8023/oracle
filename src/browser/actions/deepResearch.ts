@@ -14,11 +14,16 @@ import { delay } from "../utils.js";
 import { isDeepResearchIncompleteText } from "../deepResearchResult.js";
 import { buildClickDispatcher } from "./domEvents.js";
 import { captureAssistantMarkdown, readAssistantSnapshot } from "./assistantResponse.js";
+import {
+  captureDeepResearchMarkdownWithPlaywright,
+  type DeepResearchPlaywrightExportOptions,
+} from "./deepResearchPlaywrightExport.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
 
 type ActivateOutcome =
   | { status: "activated" }
   | { status: "already-active" }
+  | { status: "trusted-click-required"; clickPoint?: { x?: number; y?: number } }
   | { status: "plus-button-missing" }
   | { status: "dropdown-item-missing"; available?: string[] }
   | { status: "pill-not-confirmed"; clickPoint?: { x?: number; y?: number } };
@@ -47,6 +52,20 @@ export async function activateDeepResearch(
     case "already-active":
       logger("Deep Research mode already active");
       return;
+    case "trusted-click-required": {
+      const point = result.clickPoint;
+      if (typeof point?.x === "number" && typeof point.y === "number") {
+        await clickTrustedPoint(Runtime, Input, point.x, point.y);
+        if (await waitForDeepResearchPill(Runtime)) {
+          logger("Deep Research mode activated");
+          return;
+        }
+      }
+      throw new BrowserAutomationError(
+        "Deep Research pill did not appear after trusted selection. The UI may have changed.",
+        { stage: "deep-research-activate", code: "pill-not-confirmed" },
+      );
+    }
     case "plus-button-missing":
       throw new BrowserAutomationError(
         "Could not find the composer plus button to activate Deep Research.",
@@ -213,12 +232,14 @@ export async function waitForDeepResearchCompletion(
     ignoredTargetKeys?: readonly string[];
     requireScopedTargetOwner?: boolean;
     targetBaselineCaptured?: boolean;
+    playwrightExport?: DeepResearchPlaywrightExportOptions;
+    captureCompletedMarkdownExport?: (
+      options: DeepResearchPlaywrightExportOptions | undefined,
+      logger: BrowserLogger,
+    ) => Promise<string | null>;
+    captureFallbackForComparison?: boolean;
   },
-): Promise<{
-  text: string;
-  html?: string;
-  meta: { turnId?: string | null; messageId?: string | null };
-}> {
+): Promise<DeepResearchCompletionResult> {
   const start = Date.now();
   let lastLogTime = start;
   let lastTextLength = 0;
@@ -233,6 +254,8 @@ export async function waitForDeepResearchCompletion(
     (scopedToNewTurns && options?.targetBaselineCaptured !== true);
   let observedResearchEvidence = false;
   let loggedIncompleteResult = false;
+  const captureCompletedMarkdownExport =
+    options?.captureCompletedMarkdownExport ?? captureDeepResearchMarkdownWithPlaywright;
 
   logger(`Monitoring Deep Research (timeout: ${Math.round(timeoutMs / 60_000)}min)...`);
 
@@ -305,10 +328,32 @@ export async function waitForDeepResearchCompletion(
     );
     if (read?.completed && read.text) {
       logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
+      const exportedMarkdown = await captureCompletedMarkdownExport(
+        options?.playwrightExport,
+        logger,
+      );
+      if (exportedMarkdown && !isDeepResearchIncompleteText(exportedMarkdown)) {
+        logger("Deep Research report downloaded via Playwright Markdown export");
+        return {
+          text: exportedMarkdown,
+          html: read.html,
+          meta: { turnId: null, messageId: null },
+          comparison: {
+            selected: "download",
+            fallbackText: read.text,
+            downloadedMarkdown: exportedMarkdown,
+          },
+        };
+      }
       return {
         text: read.text,
         html: read.html,
         meta: { turnId: null, messageId: null },
+        comparison: {
+          selected: "fallback",
+          fallbackText: read.text,
+          downloadedMarkdown: exportedMarkdown ?? undefined,
+        },
       };
     }
 
@@ -321,7 +366,48 @@ export async function waitForDeepResearchCompletion(
         );
       }
       logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
-      return await extractDeepResearchResult(Runtime, logger, minTurnIndex ?? undefined);
+      const exportedMarkdown = await captureCompletedMarkdownExport(
+        options?.playwrightExport,
+        logger,
+      );
+      let fallbackResult: DeepResearchCompletionResult | null = null;
+      const exportedMarkdownUsable =
+        Boolean(exportedMarkdown) &&
+        !isDeepResearchIncompleteText(exportedMarkdown ?? "");
+      if (!exportedMarkdownUsable || options?.captureFallbackForComparison) {
+        fallbackResult = await extractDeepResearchResult(
+          Runtime,
+          logger,
+          minTurnIndex ?? undefined,
+        ).catch(() => null);
+      }
+      if (exportedMarkdownUsable && exportedMarkdown) {
+        logger("Deep Research report downloaded via Playwright Markdown export");
+        return {
+          text: exportedMarkdown,
+          html: fallbackResult?.html,
+          meta: fallbackResult?.meta ?? { turnId: null, messageId: null },
+          comparison: {
+            selected: "download",
+            fallbackText: fallbackResult?.text,
+            downloadedMarkdown: exportedMarkdown,
+          },
+        };
+      }
+      if (fallbackResult) {
+        return {
+          ...fallbackResult,
+          comparison: {
+            selected: "fallback",
+            fallbackText: fallbackResult.text,
+            downloadedMarkdown: exportedMarkdown ?? undefined,
+          },
+        };
+      }
+      throw new BrowserAutomationError(
+        "Deep Research completed but failed to extract the response text.",
+        { stage: "deep-research-extract", code: "extraction-failed" },
+      );
     }
 
     const incompleteFrameResult = Boolean(
@@ -337,7 +423,7 @@ export async function waitForDeepResearchCompletion(
     const now = Date.now();
     if (now - lastLogTime >= 60_000) {
       const elapsed = Math.round((now - start) / 1000);
-      const chars = Math.max(val?.textLength ?? 0, read?.textLength ?? 0);
+      const chars = Math.max(val?.textLength ?? 0, read?.textLength ?? 0, lastTextLength);
       const phase =
         read?.inProgress || val?.hasIframe
           ? "researching"
@@ -364,6 +450,17 @@ export async function waitForDeepResearchCompletion(
       lastTextLength,
     },
   );
+}
+
+export interface DeepResearchCompletionResult {
+  text: string;
+  html?: string;
+  meta: { turnId?: string | null; messageId?: string | null };
+  comparison?: {
+    selected: "download" | "fallback";
+    fallbackText?: string;
+    downloadedMarkdown?: string;
+  };
 }
 
 /**
@@ -1126,29 +1223,53 @@ function buildFindDeepResearchPillExpression(functionName = "findDeepResearchPil
   const pillLabel = JSON.stringify(DEEP_RESEARCH_PILL_LABEL);
   return `const ${functionName} = () => {
       const label = ${pillLabel}.toLowerCase();
+      const isVisible = (item) => {
+        const rect = item.getBoundingClientRect?.();
+        if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+        const style = window.getComputedStyle?.(item);
+        return !style || (style.visibility !== 'hidden' && style.display !== 'none');
+      };
+      const findComposerRoots = () => {
+        const anchors = Array.from(document.querySelectorAll(
+          '#prompt-textarea, textarea, [contenteditable="true"], [data-testid="composer-plus-btn"]'
+        )).filter(item => item instanceof Element && isVisible(item));
+        const roots = [];
+        const seen = new Set();
+        for (const anchor of anchors) {
+          const root =
+            anchor.closest('[data-testid="composer"]') ||
+            anchor.closest('form') ||
+            anchor.closest('[class*="composer"]');
+          if (!root || seen.has(root)) continue;
+          if (!root.querySelector('#prompt-textarea, textarea, [contenteditable="true"], [data-testid="composer-plus-btn"]')) continue;
+          seen.add(root);
+          roots.push(root);
+        }
+        return roots;
+      };
       const selectors = [
         '.__composer-pill-composite',
         '.__composer-pill',
         '[class*="composer-pill"]',
       ].join(',');
-      const candidates = Array.from(document.querySelectorAll(selectors));
-      const composerRoots = Array.from(document.querySelectorAll('[data-testid="composer"], form, [class*="composer"]'));
+      const candidates = [];
+      const composerRoots = findComposerRoots();
       for (const root of composerRoots) {
+        candidates.push(...Array.from(root.querySelectorAll(selectors)));
         candidates.push(...Array.from(root.querySelectorAll('button, [role="button"], [class*="pill"], [class*="composer-pill"]')));
       }
       const seen = new Set();
       for (const pill of candidates) {
         if (!(pill instanceof Element) || seen.has(pill)) continue;
         seen.add(pill);
-        const rect = pill.getBoundingClientRect?.();
-        if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+        if (!isVisible(pill)) continue;
         const text = (pill.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
         const aria = (
           pill.getAttribute('aria-label') ||
           pill.querySelector('button')?.getAttribute('aria-label') ||
           ''
         ).toLowerCase();
-        if (text.includes(label) || aria.includes(label)) {
+        if (text.includes(label) || aria.includes(label) || text.includes('深度研究') || aria.includes('深度研究')) {
           return pill;
         }
       }
@@ -1247,8 +1368,12 @@ function buildActivateDeepResearchExpression(): string {
     const isDeepResearchText = (text) => (
       text === target ||
       text.startsWith(target + ' ') ||
+      text === '深度研究' ||
+      text.startsWith('深度研究 ') ||
+      text === '获取详细报告' ||
       text === 'get a detailed report' ||
       text.startsWith('get a detailed report ') ||
+      (text.includes('深度研究') && text.includes('详细报告')) ||
       (text.includes(target) && text.includes('detailed report')) ||
       text.replace(/\\s+/g, '').startsWith('deepresearch')
     );
@@ -1348,6 +1473,7 @@ function buildActivateDeepResearchExpression(): string {
     const clickPoint = rect && rect.width > 0 && rect.height > 0
       ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
       : undefined;
+    if (clickPoint) return { status: 'trusted-click-required', clickPoint };
     dispatchClickSequence(match);
 
     // Step 5: Verify pill appeared

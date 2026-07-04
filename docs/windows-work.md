@@ -11,3 +11,4 @@ Read this file whenever you're working from Windows and add new findings so the 
 Future Windows gotchas belong here. Update this doc when you learn something new.
 
 - ChatGPT sidebar/history labels can include phrases like "Login setup instruction"; login probes must match exact auth CTAs, not any visible text starting with login, or manual-login automation loops forever before typing.
+- Deep Research export restores can render the `internal://deep-research` iframe at a collapsed height before the report card expands; wait for a full bounding box before clicking the export menu coordinates.
