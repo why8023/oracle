@@ -15,9 +15,11 @@ import { isDeepResearchIncompleteText } from "../deepResearchResult.js";
 import { buildClickDispatcher } from "./domEvents.js";
 import { captureAssistantMarkdown, readAssistantSnapshot } from "./assistantResponse.js";
 import {
-  captureDeepResearchMarkdownWithPlaywright,
-  type DeepResearchPlaywrightExportOptions,
-} from "./deepResearchPlaywrightExport.js";
+  type DeepResearchCompletionResult,
+  type DeepResearchResultExportOptions,
+  resolveDeepResearchResultFromCompletedRead,
+  resolveDeepResearchResultFromFinishedState,
+} from "./deepResearchResultExport.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
 
 type ActivateOutcome =
@@ -232,13 +234,7 @@ export async function waitForDeepResearchCompletion(
     ignoredTargetKeys?: readonly string[];
     requireScopedTargetOwner?: boolean;
     targetBaselineCaptured?: boolean;
-    playwrightExport?: DeepResearchPlaywrightExportOptions;
-    captureCompletedMarkdownExport?: (
-      options: DeepResearchPlaywrightExportOptions | undefined,
-      logger: BrowserLogger,
-    ) => Promise<string | null>;
-    captureFallbackForComparison?: boolean;
-  },
+  } & DeepResearchResultExportOptions,
 ): Promise<DeepResearchCompletionResult> {
   const start = Date.now();
   let lastLogTime = start;
@@ -254,8 +250,6 @@ export async function waitForDeepResearchCompletion(
     (scopedToNewTurns && options?.targetBaselineCaptured !== true);
   let observedResearchEvidence = false;
   let loggedIncompleteResult = false;
-  const captureCompletedMarkdownExport =
-    options?.captureCompletedMarkdownExport ?? captureDeepResearchMarkdownWithPlaywright;
 
   logger(`Monitoring Deep Research (timeout: ${Math.round(timeoutMs / 60_000)}min)...`);
 
@@ -328,33 +322,15 @@ export async function waitForDeepResearchCompletion(
     );
     if (read?.completed && read.text) {
       logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
-      const exportedMarkdown = await captureCompletedMarkdownExport(
-        options?.playwrightExport,
-        logger,
-      );
-      if (exportedMarkdown && !isDeepResearchIncompleteText(exportedMarkdown)) {
-        logger("Deep Research report downloaded via Playwright Markdown export");
-        return {
-          text: exportedMarkdown,
+      return await resolveDeepResearchResultFromCompletedRead({
+        fallback: {
+          text: read.text,
           html: read.html,
           meta: { turnId: null, messageId: null },
-          comparison: {
-            selected: "download",
-            fallbackText: read.text,
-            downloadedMarkdown: exportedMarkdown,
-          },
-        };
-      }
-      return {
-        text: read.text,
-        html: read.html,
-        meta: { turnId: null, messageId: null },
-        comparison: {
-          selected: "fallback",
-          fallbackText: read.text,
-          downloadedMarkdown: exportedMarkdown ?? undefined,
         },
-      };
+        exportOptions: options,
+        logger,
+      });
     }
 
     // Completion detected
@@ -366,43 +342,13 @@ export async function waitForDeepResearchCompletion(
         );
       }
       logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
-      const exportedMarkdown = await captureCompletedMarkdownExport(
-        options?.playwrightExport,
+      const result = await resolveDeepResearchResultFromFinishedState({
+        exportOptions: options,
+        extractFallback: () => extractDeepResearchResult(Runtime, logger, minTurnIndex ?? undefined),
         logger,
-      );
-      let fallbackResult: DeepResearchCompletionResult | null = null;
-      const exportedMarkdownUsable =
-        Boolean(exportedMarkdown) &&
-        !isDeepResearchIncompleteText(exportedMarkdown ?? "");
-      if (!exportedMarkdownUsable || options?.captureFallbackForComparison) {
-        fallbackResult = await extractDeepResearchResult(
-          Runtime,
-          logger,
-          minTurnIndex ?? undefined,
-        ).catch(() => null);
-      }
-      if (exportedMarkdownUsable && exportedMarkdown) {
-        logger("Deep Research report downloaded via Playwright Markdown export");
-        return {
-          text: exportedMarkdown,
-          html: fallbackResult?.html,
-          meta: fallbackResult?.meta ?? { turnId: null, messageId: null },
-          comparison: {
-            selected: "download",
-            fallbackText: fallbackResult?.text,
-            downloadedMarkdown: exportedMarkdown,
-          },
-        };
-      }
-      if (fallbackResult) {
-        return {
-          ...fallbackResult,
-          comparison: {
-            selected: "fallback",
-            fallbackText: fallbackResult.text,
-            downloadedMarkdown: exportedMarkdown ?? undefined,
-          },
-        };
+      });
+      if (result) {
+        return result;
       }
       throw new BrowserAutomationError(
         "Deep Research completed but failed to extract the response text.",
@@ -450,17 +396,6 @@ export async function waitForDeepResearchCompletion(
       lastTextLength,
     },
   );
-}
-
-export interface DeepResearchCompletionResult {
-  text: string;
-  html?: string;
-  meta: { turnId?: string | null; messageId?: string | null };
-  comparison?: {
-    selected: "download" | "fallback";
-    fallbackText?: string;
-    downloadedMarkdown?: string;
-  };
 }
 
 /**

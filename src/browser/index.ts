@@ -50,7 +50,6 @@ import { startThinkingStatusMonitor } from "./actions/thinkingStatus.js";
 import {
   activateDeepResearch,
   captureDeepResearchTargetKeys,
-  type DeepResearchCompletionResult,
   waitForDeepResearchCompletion,
   waitForResearchPlanAutoConfirm,
 } from "./actions/deepResearch.js";
@@ -83,9 +82,12 @@ import {
 import {
   appendArtifacts,
   saveBrowserTranscriptArtifact,
-  saveDeepResearchReportArtifact,
-  writeTextBrowserArtifact,
 } from "./artifacts.js";
+import {
+  hasSavedDeepResearchRunArtifacts,
+  saveDeepResearchRunArtifacts,
+  shouldSaveDeepResearchAbArtifacts,
+} from "./deepResearchArtifacts.js";
 import { collectGeneratedImageArtifacts } from "./chatgptImages.js";
 import { collectChatGptFileArtifacts } from "./chatgptFiles.js";
 import { runProviderSubmissionFlow } from "./providerDomFlow.js";
@@ -507,61 +509,6 @@ async function saveOptionalArtifact<T>(
     logger(`[browser] Failed to save session artifact: ${message}`);
     return null;
   }
-}
-
-function shouldSaveDeepResearchAbArtifacts(): boolean {
-  const value = process.env.ORACLE_DEEP_RESEARCH_AB_EXPORT?.trim().toLowerCase();
-  return value === "1" || value === "true" || value === "yes";
-}
-
-async function saveDeepResearchAbComparisonArtifacts(params: {
-  sessionId?: string;
-  result: DeepResearchCompletionResult;
-  conversationUrl?: string;
-  logger: BrowserLogger;
-}) {
-  const comparison = params.result.comparison;
-  if (!shouldSaveDeepResearchAbArtifacts() || !params.sessionId || !comparison) {
-    return undefined;
-  }
-
-  const fallbackArtifact = comparison.fallbackText?.trim()
-    ? await saveOptionalArtifact(
-        () =>
-          writeTextBrowserArtifact({
-            sessionId: params.sessionId,
-            kind: "file",
-            filename: "deep-research-report.fallback-extracted.md",
-            contents: comparison.fallbackText ?? "",
-            label: "Deep Research fallback extraction",
-            mimeType: "text/markdown",
-            sourceUrl: params.conversationUrl,
-            logger: params.logger,
-          }),
-        params.logger,
-      )
-    : null;
-  const downloadArtifact = comparison.downloadedMarkdown?.trim()
-    ? await saveOptionalArtifact(
-        () =>
-          writeTextBrowserArtifact({
-            sessionId: params.sessionId,
-            kind: "file",
-            filename: "deep-research-report.download.md",
-            contents: comparison.downloadedMarkdown ?? "",
-            label: "Deep Research Markdown download",
-            mimeType: "text/markdown",
-            sourceUrl: params.conversationUrl,
-            logger: params.logger,
-          }),
-        params.logger,
-      )
-    : null;
-  const artifacts = appendArtifacts(undefined, [fallbackArtifact, downloadArtifact]);
-  if (artifacts?.length) {
-    params.logger(`[browser] Saved Deep Research A/B comparison artifacts`);
-  }
-  return artifacts;
 }
 
 type AssistantAnswer = {
@@ -1708,46 +1655,20 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       runStatus = "complete";
       const durationMs = Date.now() - startedAt;
       const tokens = estimateTokenCount(researchResult.text);
-      const reportArtifact = await saveOptionalArtifact(
-        () =>
-          saveDeepResearchReportArtifact({
-            sessionId: options.sessionId,
-            reportMarkdown: researchResult.text,
-            conversationUrl: lastUrl,
-            logger,
-          }),
-        logger,
-      );
-      const comparisonArtifacts = await saveDeepResearchAbComparisonArtifacts({
+      const savedArtifacts = await saveDeepResearchRunArtifacts({
         sessionId: options.sessionId,
+        prompt: promptText,
         result: researchResult,
         conversationUrl: lastUrl,
         logger,
       });
-      const researchArtifacts = appendArtifacts(
-        appendArtifacts(undefined, [reportArtifact]),
-        comparisonArtifacts ?? [],
-      );
-      const transcriptArtifact = await saveOptionalArtifact(
-        () =>
-          saveBrowserTranscriptArtifact({
-            sessionId: options.sessionId,
-            prompt: promptText,
-            answerMarkdown: researchResult.text,
-            conversationUrl: lastUrl,
-            artifacts: researchArtifacts,
-            logger,
-          }),
-        logger,
-      );
-      const savedArtifacts = appendArtifacts(researchArtifacts, [transcriptArtifact]);
       const archive = await maybeArchiveCompletedConversation({
         Runtime,
         logger,
         config,
         conversationUrl: lastUrl,
         followUpCount: 0,
-        requiredArtifactsSaved: Boolean(reportArtifact && transcriptArtifact),
+        requiredArtifactsSaved: hasSavedDeepResearchRunArtifacts(savedArtifacts),
       });
       return {
         answerText: researchResult.text,
@@ -3205,46 +3126,20 @@ async function runRemoteBrowserMode(
       await activeConversationUrlMonitor.update("post-deep-research", 15_000).catch(() => false);
       const durationMs = Date.now() - startedAt;
       const tokens = estimateTokenCount(researchResult.text);
-      const reportArtifact = await saveOptionalArtifact(
-        () =>
-          saveDeepResearchReportArtifact({
-            sessionId: options.sessionId,
-            reportMarkdown: researchResult.text,
-            conversationUrl: lastUrl,
-            logger,
-          }),
-        logger,
-      );
-      const comparisonArtifacts = await saveDeepResearchAbComparisonArtifacts({
+      const savedArtifacts = await saveDeepResearchRunArtifacts({
         sessionId: options.sessionId,
+        prompt: promptText,
         result: researchResult,
         conversationUrl: lastUrl,
         logger,
       });
-      const researchArtifacts = appendArtifacts(
-        appendArtifacts(undefined, [reportArtifact]),
-        comparisonArtifacts ?? [],
-      );
-      const transcriptArtifact = await saveOptionalArtifact(
-        () =>
-          saveBrowserTranscriptArtifact({
-            sessionId: options.sessionId,
-            prompt: promptText,
-            answerMarkdown: researchResult.text,
-            conversationUrl: lastUrl,
-            artifacts: researchArtifacts,
-            logger,
-          }),
-        logger,
-      );
-      const savedArtifacts = appendArtifacts(researchArtifacts, [transcriptArtifact]);
       const archive = await maybeArchiveCompletedConversation({
         Runtime,
         logger,
         config,
         conversationUrl: lastUrl,
         followUpCount: 0,
-        requiredArtifactsSaved: Boolean(reportArtifact && transcriptArtifact),
+        requiredArtifactsSaved: hasSavedDeepResearchRunArtifacts(savedArtifacts),
       });
       runStatus = "complete";
       return {
