@@ -76,6 +76,7 @@ function selectDeepResearchPage<T extends { url(): string }>(
     return null;
   }
 
+  const hasTargetConversation = Boolean(conversationUrl?.trim());
   const targetConversationId = extractChatGptConversationId(conversationUrl ?? "");
   if (targetConversationId) {
     const exact = pages.find((page) => page.url().includes(`/c/${targetConversationId}`));
@@ -90,6 +91,10 @@ function selectDeepResearchPage<T extends { url(): string }>(
     if (exact) {
       return exact;
     }
+  }
+
+  if (hasTargetConversation) {
+    return null;
   }
 
   return pages.find((page) => isChatGptConversationPage(page.url())) ?? null;

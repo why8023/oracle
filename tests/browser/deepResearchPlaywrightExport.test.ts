@@ -25,6 +25,20 @@ describe("Deep Research Playwright export helpers", () => {
     expect(deepResearchPlaywrightExportForTest.selectDeepResearchPage(pages)).toBe(pages[1]);
   });
 
+  it("does not fall back to a different conversation when a target URL is supplied", () => {
+    const pages = [
+      { url: () => "about:blank" },
+      { url: () => "https://chatgpt.com/g/g-p-example-oracle/c/old-conversation" },
+    ];
+
+    expect(
+      deepResearchPlaywrightExportForTest.selectDeepResearchPage(
+        pages,
+        "https://chatgpt.com/g/g-p-example-oracle/c/new-conversation",
+      ),
+    ).toBeNull();
+  });
+
   it("targets the export button before the expand button on compact embedded reports", () => {
     const attempts = deepResearchPlaywrightExportForTest.buildDeepResearchExportClickAttempts({
       x: 510,
