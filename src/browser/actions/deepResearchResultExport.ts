@@ -105,7 +105,8 @@ function captureCompletedDeepResearchMarkdown(
   options: DeepResearchResultExportOptions | undefined,
   logger: BrowserLogger,
 ): Promise<string | null> {
-  const capture = options?.captureCompletedMarkdownExport ?? captureDeepResearchMarkdownWithPlaywright;
+  const capture =
+    options?.captureCompletedMarkdownExport ?? captureDeepResearchMarkdownWithPlaywright;
   return capture(options?.playwrightExport, logger);
 }
 

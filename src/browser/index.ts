@@ -79,10 +79,7 @@ import {
   hasOtherActiveBrowserTabLeases,
   type BrowserTabLease,
 } from "./tabLeaseRegistry.js";
-import {
-  appendArtifacts,
-  saveBrowserTranscriptArtifact,
-} from "./artifacts.js";
+import { appendArtifacts, saveBrowserTranscriptArtifact } from "./artifacts.js";
 import {
   hasSavedDeepResearchRunArtifacts,
   saveDeepResearchRunArtifacts,

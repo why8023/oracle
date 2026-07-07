@@ -120,7 +120,9 @@ async function exportDeepResearchMarkdownFromPage(
     for (const attempt of buildDeepResearchExportClickAttempts(box)) {
       await page.keyboard.press("Escape").catch(() => undefined);
       await page.waitForTimeout(150);
-      const downloadPromise = page.waitForEvent("download", { timeout: timeoutMs }).catch(() => null);
+      const downloadPromise = page
+        .waitForEvent("download", { timeout: timeoutMs })
+        .catch(() => null);
 
       try {
         await page.mouse.click(attempt.menuButton.x, attempt.menuButton.y);
@@ -206,7 +208,10 @@ async function deepResearchIframeBoxes(
   if (logger?.verbose) {
     logger(
       `Deep Research Playwright export iframe scan: count=${count}, boxes=${boxes
-        .map((box) => `${Math.round(box.x)},${Math.round(box.y)},${Math.round(box.width)}x${Math.round(box.height)}`)
+        .map(
+          (box) =>
+            `${Math.round(box.x)},${Math.round(box.y)},${Math.round(box.width)}x${Math.round(box.height)}`,
+        )
         .join(";")}`,
     );
   }

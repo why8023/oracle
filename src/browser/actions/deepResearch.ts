@@ -344,7 +344,8 @@ export async function waitForDeepResearchCompletion(
       logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
       const result = await resolveDeepResearchResultFromFinishedState({
         exportOptions: options,
-        extractFallback: () => extractDeepResearchResult(Runtime, logger, minTurnIndex ?? undefined),
+        extractFallback: () =>
+          extractDeepResearchResult(Runtime, logger, minTurnIndex ?? undefined),
         logger,
       });
       if (result) {

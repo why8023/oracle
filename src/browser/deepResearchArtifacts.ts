@@ -55,10 +55,12 @@ export async function saveDeepResearchRunArtifacts(params: {
   return appendArtifacts(researchArtifacts, [transcriptArtifact]);
 }
 
-export function hasSavedDeepResearchRunArtifacts(artifacts: SessionArtifact[] | undefined): boolean {
+export function hasSavedDeepResearchRunArtifacts(
+  artifacts: SessionArtifact[] | undefined,
+): boolean {
   return Boolean(
     artifacts?.some((artifact) => artifact.kind === "deep-research-report") &&
-      artifacts?.some((artifact) => artifact.kind === "transcript"),
+    artifacts?.some((artifact) => artifact.kind === "transcript"),
   );
 }
 
