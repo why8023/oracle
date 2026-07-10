@@ -295,3 +295,98 @@ describe("promptComposer", () => {
     expect(onPromptSubmitted).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("trusted send-click fallback", () => {
+  test("sendTookEffect resolves true as soon as the page shows the send landed", async () => {
+    const runtime = {
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce({ result: { value: false } })
+        .mockResolvedValueOnce({ result: { value: true } }),
+    } as unknown as { evaluate: (args: { expression: string }) => Promise<unknown> };
+
+    await expect(promptComposer.sendTookEffect(runtime as never)).resolves.toBe(true);
+  });
+
+  test("sendTookEffect resolves false when the click is swallowed", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({ result: { value: false } }),
+      } as unknown as { evaluate: (args: { expression: string }) => Promise<unknown> };
+
+      const promise = promptComposer.sendTookEffect(runtime as never);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(promise).resolves.toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("dispatchSendButtonClick reports whether an enabled send button was still there", async () => {
+    const clicked = {
+      evaluate: vi.fn().mockResolvedValue({ result: { value: true } }),
+    } as unknown as { evaluate: (args: { expression: string }) => Promise<unknown> };
+    await expect(promptComposer.dispatchSendButtonClick(clicked as never)).resolves.toBe(true);
+
+    // No enabled send button left (the prompt already submitted) -> no second send.
+    const gone = {
+      evaluate: vi.fn().mockResolvedValue({ result: { value: false } }),
+    } as unknown as { evaluate: (args: { expression: string }) => Promise<unknown> };
+    await expect(promptComposer.dispatchSendButtonClick(gone as never)).resolves.toBe(false);
+  });
+
+  test("falls back to a DOM click when the trusted click is swallowed", async () => {
+    vi.useFakeTimers();
+    try {
+      let fallbackDispatched = false;
+      const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("button.scrollIntoView")) {
+          return { result: { value: { status: "point", x: 10, y: 20 } } };
+        }
+        if (expression.includes("dispatchClickSequence(button)")) {
+          fallbackDispatched = true;
+          return { result: { value: true } };
+        }
+        // sendTookEffect probe: the hidden window swallowed the click.
+        return { result: { value: false } };
+      });
+      const input = { dispatchMouseEvent: vi.fn() };
+
+      const promise = promptComposer.attemptSendButton(
+        { evaluate } as never,
+        input as never,
+        undefined,
+        undefined,
+      );
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(promise).resolves.toBe(true);
+      expect(input.dispatchMouseEvent).toHaveBeenCalled();
+      expect(fallbackDispatched).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not dispatch the DOM fallback when the trusted click landed", async () => {
+    let fallbackDispatched = false;
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression.includes("button.scrollIntoView")) {
+        return { result: { value: { status: "point", x: 10, y: 20 } } };
+      }
+      if (expression.includes("dispatchClickSequence(button)")) {
+        fallbackDispatched = true;
+        return { result: { value: true } };
+      }
+      // sendTookEffect probe: composer cleared, send landed.
+      return { result: { value: true } };
+    });
+    const input = { dispatchMouseEvent: vi.fn() };
+
+    await expect(
+      promptComposer.attemptSendButton({ evaluate } as never, input as never, undefined, undefined),
+    ).resolves.toBe(true);
+    expect(input.dispatchMouseEvent).toHaveBeenCalled();
+    expect(fallbackDispatched).toBe(false);
+  });
+});
