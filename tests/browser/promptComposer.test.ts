@@ -25,7 +25,7 @@ describe("promptComposer", () => {
     );
   });
 
-  test("does not treat cleared composer + stop button as committed without a new turn", async () => {
+  test("does not treat historical assistant content as committed without a new turn", async () => {
     vi.useFakeTimers();
     try {
       const runtime = {
@@ -44,7 +44,7 @@ describe("promptComposer", () => {
                 lastMatched: false,
                 hasNewTurn: false,
                 stopVisible: true,
-                assistantVisible: false,
+                assistantVisible: true,
                 composerCleared: true,
                 inConversation: false,
               },
@@ -293,5 +293,35 @@ describe("promptComposer", () => {
     );
 
     expect(onPromptSubmitted).toHaveBeenCalledTimes(1);
+  });
+
+  test("waits for a delayed trusted click without issuing a second send", async () => {
+    vi.useFakeTimers();
+    try {
+      const evaluate = vi.fn().mockResolvedValue({
+        result: { value: { status: "point", x: 10, y: 20 } },
+      });
+      const input = {
+        dispatchMouseEvent: vi.fn(async ({ type }: { type: string }) => {
+          if (type === "mouseReleased") {
+            await new Promise((resolve) => setTimeout(resolve, 1_000));
+          }
+        }),
+      };
+
+      const result = promptComposer.attemptSendButton(
+        { evaluate } as never,
+        input as never,
+        undefined,
+        undefined,
+      );
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      await expect(result).resolves.toBe(true);
+      expect(evaluate).toHaveBeenCalledTimes(1);
+      expect(input.dispatchMouseEvent).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

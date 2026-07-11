@@ -16,7 +16,7 @@ import type {
 import {
   launchChrome,
   registerTerminationHooks,
-  hideChromeWindow,
+  positionChromeWindowOffscreen,
   connectToRemoteChrome,
   connectWithNewTab,
   closeTab,
@@ -446,6 +446,29 @@ async function createAssistantTimeoutError(params: {
     );
   }
   return warningError;
+}
+
+/**
+ * Make the page behave like a focused foreground tab.
+ *
+ * The send button is activated with trusted CDP input events dispatched at
+ * viewport coordinates. Chrome delivers those only to a window that is being
+ * composited, so a hidden (`--browser-hide-window`), minimized, or occluded
+ * window swallows the click while the automation still believes it clicked.
+ * Soft-fails: focus emulation is an optimization, never a hard requirement.
+ */
+async function enableFocusEmulation(
+  client: ChromeClient,
+  logger: BrowserLogger,
+  label: string,
+): Promise<void> {
+  try {
+    await client.Emulation.setFocusEmulationEnabled({ enabled: true });
+    logger(`[browser] Focus emulation enabled for ${label}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger(`[browser] Focus emulation unavailable: ${message}`);
+  }
 }
 
 function listIgnoredRemoteChromeFlags(config: {
@@ -1144,15 +1167,18 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       Promise.race([promise, disconnectPromise]);
     const { Network, Page, Runtime, Input, DOM, Target } = client;
 
-    if (!config.headless && config.hideWindow) {
-      await hideChromeWindow(chrome, logger);
-    }
-
     const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
     if (DOM && typeof DOM.enable === "function") {
       domainEnablers.push(DOM.enable());
     }
     await Promise.all(domainEnablers);
+    if (!config.headless && config.hideWindow) {
+      await positionChromeWindowOffscreen(client, logger);
+    }
+    // The send button is clicked with trusted CDP input events at viewport
+    // coordinates, which ChatGPT silently drops when the window is hidden or
+    // occluded. Emulate focus so the page behaves like a foreground tab.
+    await enableFocusEmulation(client, logger, "local target");
     removeDialogHandler = installJavaScriptDialogAutoDismissal(Page, logger);
     if (!profileIsPreSigned) {
       await Network.clearBrowserCookies();
@@ -2836,13 +2862,7 @@ async function runRemoteBrowserMode(
     }
     await Promise.all(domainEnablers);
     removeDialogHandler = installJavaScriptDialogAutoDismissal(Page, logger);
-    try {
-      await client.Emulation.setFocusEmulationEnabled({ enabled: true });
-      logger("[browser] Focus emulation enabled for remote target");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logger(`[browser] Focus emulation unavailable: ${message}`);
-    }
+    await enableFocusEmulation(client, logger, "remote target");
 
     const activeConversationUrlMonitor = createConversationUrlMonitor({
       readUrl: async () => {
