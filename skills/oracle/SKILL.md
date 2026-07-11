@@ -7,8 +7,8 @@ description: "Oracle second-model review with browser/API execution, GPT-5.6 Sol
 
 Oracle bundles a prompt and selected files into a one-shot request so another
 model can answer with real repository context through the API or browser. A
-prompt and at least one `--file` input are required. Treat responses as
-advisory and verify them against the codebase and tests.
+prompt is required; attach files only when they add necessary context. Treat
+responses as advisory and verify them against the codebase and tests.
 
 ## Main use case (browser, GPT-5.6)
 
