@@ -4,14 +4,25 @@ import { isDeepResearchIncompleteText } from "../deepResearchResult.js";
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 8_000;
 const DEFAULT_EXPORT_TIMEOUT_MS = 8_000;
+const DEFAULT_EXPORT_READY_TIMEOUT_MS = 30_000;
+const EXPORT_RETRY_INTERVAL_MS = 500;
+const MAX_DOWNLOAD_EVENT_WAIT_MS = 3_000;
+const MIN_EXPORT_IFRAME_WIDTH = 500;
+const MIN_EXPORT_IFRAME_HEIGHT = 300;
+const STABLE_IFRAME_BOX_DELTA_PX = 8;
 const DEEP_RESEARCH_IFRAME_SELECTOR = 'iframe[title="internal://deep-research"]';
+
+type DeepResearchIframeBox = { x: number; y: number; width: number; height: number };
 
 export interface DeepResearchPlaywrightExportOptions {
   chromeHost?: string | null;
   chromePort?: number | null;
   conversationUrl?: string | null;
   connectTimeoutMs?: number;
+  /** Maximum time to wait for each Markdown download event. */
   exportTimeoutMs?: number;
+  /** Maximum time to wait for a stable, expanded Deep Research report before falling back. */
+  exportReadyTimeoutMs?: number;
 }
 
 export async function captureDeepResearchMarkdownWithPlaywright(
@@ -38,7 +49,10 @@ export async function captureDeepResearchMarkdownWithPlaywright(
     }
     const markdown = await exportDeepResearchMarkdownFromPage(
       page,
-      options.exportTimeoutMs ?? DEFAULT_EXPORT_TIMEOUT_MS,
+      {
+        downloadTimeoutMs: options.exportTimeoutMs ?? DEFAULT_EXPORT_TIMEOUT_MS,
+        readyTimeoutMs: options.exportReadyTimeoutMs ?? DEFAULT_EXPORT_READY_TIMEOUT_MS,
+      },
       logger,
     );
     return markdown;
@@ -102,33 +116,120 @@ function selectDeepResearchPage<T extends { url(): string }>(
 
 async function exportDeepResearchMarkdownFromPage(
   page: Page,
-  timeoutMs: number,
+  timing: { downloadTimeoutMs: number; readyTimeoutMs: number },
   logger?: BrowserLogger,
 ): Promise<string | null> {
   await page.waitForLoadState("domcontentloaded", { timeout: 2_000 }).catch(() => undefined);
-  await revealDeepResearchIframe(page).catch(() => undefined);
+  const deadline = Date.now() + Math.max(0, timing.readyTimeoutMs);
+  let previousBoxes: DeepResearchIframeBox[] = [];
+  let lastScanSummary = "";
+  let readyExportRounds = 0;
 
-  const boxes = await deepResearchIframeBoxes(page, logger);
-  if (boxes.length === 0) {
-    if (logger?.verbose) {
-      logger("Deep Research Playwright export skipped: iframe box not found");
+  while (Date.now() < deadline) {
+    await nudgeDeepResearchIframeIntoView(page).catch(() => undefined);
+    const scan = await deepResearchIframeBoxes(page);
+    const scanSummary = formatDeepResearchIframeScan(scan);
+    if (logger?.verbose && scanSummary !== lastScanSummary) {
+      logger(`Deep Research Playwright export readiness: ${scanSummary}`);
+      lastScanSummary = scanSummary;
     }
-    return null;
+
+    if (areDeepResearchIframeBoxesStable(previousBoxes, scan.boxes)) {
+      readyExportRounds += 1;
+      const markdown = await tryExportDeepResearchMarkdown(
+        page,
+        scan.boxes,
+        deadline,
+        timing.downloadTimeoutMs,
+        logger,
+      );
+      if (markdown) {
+        return markdown;
+      }
+    }
+
+    previousBoxes = scan.boxes;
+    const remainingMs = deadline - Date.now();
+    if (remainingMs > 0) {
+      await page.waitForTimeout(Math.min(EXPORT_RETRY_INTERVAL_MS, remainingMs));
+    }
   }
 
+  if (logger?.verbose) {
+    logger(
+      `Deep Research Playwright export skipped after ${readyExportRounds} stable iframe round(s): ${
+        lastScanSummary || "iframe scan did not complete"
+      }`,
+    );
+  }
+  return null;
+}
+
+async function nudgeDeepResearchIframeIntoView(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const scrollers = Array.from(document.querySelectorAll("div,main")).filter((element) => {
+      const style = getComputedStyle(element);
+      return (
+        (style.overflowY === "auto" || style.overflowY === "scroll") &&
+        element.scrollHeight > element.clientHeight + 10
+      );
+    });
+    for (const scroller of scrollers) {
+      scroller.scrollTop = scroller.scrollHeight;
+    }
+    window.scrollTo(0, document.body.scrollHeight);
+  });
+}
+
+async function deepResearchIframeBoxes(page: Page): Promise<{
+  iframeCount: number;
+  boxes: DeepResearchIframeBox[];
+}> {
+  const locator = page.locator(DEEP_RESEARCH_IFRAME_SELECTOR);
+  const count = await locator.count().catch(() => 0);
+  const boxes: DeepResearchIframeBox[] = [];
+  for (let index = count - 1; index >= 0; index -= 1) {
+    const iframe = locator.nth(index);
+    await alignDeepResearchIframeForExport(iframe).catch(() => undefined);
+    const box = await iframe.boundingBox().catch(() => null);
+    if (box && isExportReadyIframeBox(box)) {
+      boxes.push(box);
+    }
+  }
+  return { iframeCount: count, boxes };
+}
+
+async function tryExportDeepResearchMarkdown(
+  page: Page,
+  boxes: readonly DeepResearchIframeBox[],
+  deadline: number,
+  downloadTimeoutMs: number,
+  logger?: BrowserLogger,
+): Promise<string | null> {
   for (const box of boxes) {
     for (const attempt of buildDeepResearchExportClickAttempts(box)) {
       await page.keyboard.press("Escape").catch(() => undefined);
-      await page.waitForTimeout(150);
-      const downloadPromise = page
-        .waitForEvent("download", { timeout: timeoutMs })
-        .catch(() => null);
+      const preClickRemainingMs = deadline - Date.now();
+      if (preClickRemainingMs <= 0) {
+        return null;
+      }
+      await page.waitForTimeout(Math.min(150, preClickRemainingMs));
 
+      let downloadPromise: Promise<Download | null> | undefined;
       try {
         await page.mouse.click(attempt.menuButton.x, attempt.menuButton.y);
-        await page.waitForTimeout(500);
+        await page.waitForTimeout(Math.min(500, Math.max(0, deadline - Date.now())));
+        const downloadWaitMs = Math.min(
+          downloadTimeoutMs,
+          MAX_DOWNLOAD_EVENT_WAIT_MS,
+          Math.max(1, deadline - Date.now()),
+        );
+        downloadPromise = page
+          .waitForEvent("download", { timeout: downloadWaitMs })
+          .catch(() => null);
         await page.mouse.click(attempt.markdownItem.x, attempt.markdownItem.y);
       } catch {
+        await downloadPromise;
         continue;
       }
 
@@ -149,73 +250,44 @@ async function exportDeepResearchMarkdownFromPage(
       }
     }
   }
-
-  if (logger?.verbose) {
-    logger("Deep Research Playwright export skipped: no Markdown download completed");
-  }
   return null;
 }
 
-async function revealDeepResearchIframe(page: Page): Promise<void> {
-  for (let attempt = 0; attempt < 24; attempt += 1) {
-    const visible = await page
-      .locator(DEEP_RESEARCH_IFRAME_SELECTOR)
-      .first()
-      .isVisible({ timeout: 250 })
-      .catch(() => false);
-    if (visible) {
-      const iframe = page.locator(DEEP_RESEARCH_IFRAME_SELECTOR).last();
-      await alignDeepResearchIframeForExport(iframe).catch(() => {});
-      const box = await iframe.boundingBox().catch(() => null);
-      if (box && box.width >= 250 && box.height >= 150) {
-        return;
-      }
-    }
-
-    await page.evaluate(() => {
-      const scrollers = Array.from(document.querySelectorAll("div,main")).filter((element) => {
-        const style = getComputedStyle(element);
-        return (
-          (style.overflowY === "auto" || style.overflowY === "scroll") &&
-          element.scrollHeight > element.clientHeight + 10
-        );
-      });
-      for (const scroller of scrollers) {
-        scroller.scrollTop = scroller.scrollHeight;
-      }
-      window.scrollTo(0, document.body.scrollHeight);
-    });
-    await page.waitForTimeout(300);
-  }
+function isExportReadyIframeBox(box: DeepResearchIframeBox): boolean {
+  return box.width >= MIN_EXPORT_IFRAME_WIDTH && box.height >= MIN_EXPORT_IFRAME_HEIGHT;
 }
 
-async function deepResearchIframeBoxes(
-  page: Page,
-  logger?: BrowserLogger,
-): Promise<Array<{ x: number; y: number; width: number; height: number }>> {
-  const locator = page.locator(DEEP_RESEARCH_IFRAME_SELECTOR);
-  const count = await locator.count().catch(() => 0);
-  const boxes: Array<{ x: number; y: number; width: number; height: number }> = [];
-  for (let index = count - 1; index >= 0; index -= 1) {
-    const iframe = locator.nth(index);
-    await alignDeepResearchIframeForExport(iframe).catch(() => undefined);
-    await page.waitForTimeout(150);
-    const box = await iframe.boundingBox().catch(() => null);
-    if (box && box.width >= 250 && box.height >= 150) {
-      boxes.push(box);
-    }
-  }
-  if (logger?.verbose) {
-    logger(
-      `Deep Research Playwright export iframe scan: count=${count}, boxes=${boxes
-        .map(
-          (box) =>
-            `${Math.round(box.x)},${Math.round(box.y)},${Math.round(box.width)}x${Math.round(box.height)}`,
-        )
-        .join(";")}`,
-    );
-  }
-  return boxes;
+function areDeepResearchIframeBoxesStable(
+  previous: readonly DeepResearchIframeBox[],
+  current: readonly DeepResearchIframeBox[],
+): boolean {
+  return (
+    current.length > 0 &&
+    previous.length === current.length &&
+    current.every((box, index) => {
+      const prior = previous[index];
+      return (
+        prior &&
+        Math.abs(prior.x - box.x) <= STABLE_IFRAME_BOX_DELTA_PX &&
+        Math.abs(prior.y - box.y) <= STABLE_IFRAME_BOX_DELTA_PX &&
+        Math.abs(prior.width - box.width) <= STABLE_IFRAME_BOX_DELTA_PX &&
+        Math.abs(prior.height - box.height) <= STABLE_IFRAME_BOX_DELTA_PX
+      );
+    })
+  );
+}
+
+function formatDeepResearchIframeScan(scan: {
+  iframeCount: number;
+  boxes: readonly DeepResearchIframeBox[];
+}): string {
+  const boxes = scan.boxes
+    .map(
+      (box) =>
+        `${Math.round(box.x)},${Math.round(box.y)},${Math.round(box.width)}x${Math.round(box.height)}`,
+    )
+    .join(";");
+  return `iframes=${scan.iframeCount}, readyBoxes=${boxes || "none"}`;
 }
 
 async function alignDeepResearchIframeForExport(
@@ -326,9 +398,12 @@ export function buildDeepResearchExportClickAttempts(box: {
 }
 
 export const deepResearchPlaywrightExportForTest = {
+  areDeepResearchIframeBoxesStable,
   buildDeepResearchExportClickAttempts,
+  exportDeepResearchMarkdownFromPage,
   extractChatGptConversationId,
   isChatGptConversationPage,
+  isExportReadyIframeBox,
   isUsableExportedMarkdown,
   selectDeepResearchPage,
 };

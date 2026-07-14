@@ -12,3 +12,5 @@ Future Windows gotchas belong here. Update this doc when you learn something new
 
 - ChatGPT sidebar/history labels can include phrases like "Login setup instruction"; login probes must match exact auth CTAs, not any visible text starting with login, or manual-login automation loops forever before typing.
 - Deep Research export restores can render the `internal://deep-research` iframe at a collapsed height before the report card expands; wait for a full bounding box before clicking the export menu coordinates.
+- After completion, a missed first export click is not conclusive: rescan for a stable expanded iframe and retry within a bounded window before saving fallback extraction.
+- On Windows, `oracle session <id> --harvest` can time out in its recovered-conversation ready check even when the historical Deep Research page and its sandbox iframe have loaded. Treat harvest readback and Playwright Markdown export as separate paths; inspect the retained Oracle Chrome session before declaring the report non-exportable.
