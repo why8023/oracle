@@ -1,3 +1,5 @@
+enableGlobalVirtualStore: true
+
 overrides:
   devtools-protocol: 0.0.1658499
   hono: 4.12.25
