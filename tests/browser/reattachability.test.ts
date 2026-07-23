@@ -27,6 +27,11 @@ describe("hasRecoverableChatGptConversation", () => {
         tabUrl: "https://chatgpt.com/g/g-p-demo/project",
       }),
     ).toBe(false);
+    expect(
+      hasRecoverableChatGptConversation({
+        tabUrl: "https://chatgpt.com/c/WEB:32229414-5afa-4478-890c-9ca80aa82430",
+      }),
+    ).toBe(false);
   });
 
   test("rejects malformed or non-ChatGPT URLs", () => {
