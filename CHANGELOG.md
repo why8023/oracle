@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.16.1 — Unreleased
+## 0.16.2 — Unreleased
+
+## 0.16.1 — 2026-07-23
+
+### Changed
+
+- Dependencies: refresh Google GenAI, OpenAI, Clipboardy, Chrome DevTools protocol, Hono/MCP runtime security fixes, Oxc tooling, and TSX.
 
 ### Fixed
 
