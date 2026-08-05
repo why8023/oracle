@@ -42,7 +42,7 @@ oracle --followup <id> -p "Re-evaluate with this new context" --file "src/**/*.t
 
 ## Pick your path
 
-- **Trying it.** [Install](install.md) → [Quickstart](quickstart.md). Five minutes from `brew install` to your first answer.
+- **Trying it.** [Install](1_project/chatgpt%20codex%20use/.repos/oracle/docs/install.md) → [Quickstart](1_project/chatgpt%20codex%20use/.repos/oracle/docs/quickstart.md). Five minutes from `brew install` to your first answer.
 - **Choosing a model.** The [Mythical Pro Agents](mythical-pro-agents.md) lineup covers when to reach for GPT-5.5 Pro vs. Gemini 3.1 Pro vs. Claude Opus, and what each costs.
 - **Wiring up an agent.** [Agents](agents.md) covers Claude Code, Codex, Cursor, and the `oracle` skill. [MCP](mcp.md) plugs Oracle into any MCP-aware client.
 - **Driving ChatGPT without keys.** [Browser mode](browser-mode.md) walks through manual-login profiles, attach-running, remote browsers, and Deep Research.

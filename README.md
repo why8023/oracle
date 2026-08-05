@@ -148,7 +148,7 @@ Engine auto-picks API when `OPENAI_API_KEY` is set, otherwise browser; browser i
 **MCP**
 
 - Run the stdio server via `oracle-mcp`.
-- Configure clients via [steipete/mcporter](https://github.com/steipete/mcporter) or `.mcp.json`; see [docs/mcp.md](docs/mcp.md) for connection examples.
+- Configure clients via [steipete/mcporter](https://github.com/steipete/mcporter) or `.mcp.json`; see [docs/mcp.md](mcp.md) for connection examples.
 - Claude Code on the same Mac as a signed-in ChatGPT browser can generate a local config directly:
 
 ```bash
@@ -350,7 +350,7 @@ Put defaults in `~/.oracle/config.json` (JSON5). Example:
 ```
 
 Use `browser.chatgptUrl` (or the legacy alias `browser.url`) to target a specific ChatGPT workspace/folder for browser automation.
-See [docs/configuration.md](docs/configuration.md) for precedence and full schema.
+See [docs/configuration.md](configuration.md) for precedence and full schema.
 
 When several agents share one manual-login ChatGPT profile, Oracle coordinates browser tab slots through that profile. Extra runs wait and log that they are waiting for a ChatGPT browser slot instead of crashing because another Codex/Claude/CLI run is already using the browser. For the most reliable shared-agent setup, keep one signed-in Chrome open with remote debugging and point callers at it with `--remote-chrome <host:port>`; direct manual-login launches are guarded so parallel callers reuse the first reachable Chrome instead of racing separate launches on the same profile.
 
@@ -384,12 +384,12 @@ oracle status --clear --hours 168
 
 ## More docs
 
-- Bridge (Windows host → Linux client): [docs/bridge.md](docs/bridge.md)
-- Browser mode & forks: [docs/browser-mode.md](docs/browser-mode.md) (includes `oracle serve` remote service), [docs/chromium-forks.md](docs/chromium-forks.md), [docs/linux.md](docs/linux.md)
-- MCP: [docs/mcp.md](docs/mcp.md)
-- OpenAI/Azure/OpenRouter endpoints: [docs/openai-endpoints.md](docs/openai-endpoints.md), [docs/openrouter.md](docs/openrouter.md)
-- Manual smokes: [docs/manual-tests.md](docs/manual-tests.md)
-- Testing: [docs/testing.md](docs/testing.md)
+- Bridge (Windows host → Linux client): [docs/bridge.md](bridge.md)
+- Browser mode & forks: [docs/browser-mode.md](browser-mode.md) (includes `oracle serve` remote service), [docs/chromium-forks.md](chromium-forks.md), [docs/linux.md](linux.md)
+- MCP: [docs/mcp.md](mcp.md)
+- OpenAI/Azure/OpenRouter endpoints: [docs/openai-endpoints.md](openai-endpoints.md), [docs/openrouter.md](openrouter.md)
+- Manual smokes: [docs/manual-tests.md](manual-tests.md)
+- Testing: [docs/testing.md](testing.md)
 
 If you’re looking for an even more powerful context-management tool, check out https://repoprompt.com  
 Name inspired by: https://ampcode.com/news/oracle

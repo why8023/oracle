@@ -3,7 +3,7 @@ title: Quickstart
 description: "From install to first Oracle consult in five minutes — pick API or browser mode, send a bundle, replay the session."
 ---
 
-This walks through the minimum to get a useful answer back. If you haven't installed Oracle yet, start with [Install](install.md).
+This walks through the minimum to get a useful answer back. If you haven't installed Oracle yet, start with [Install](1_project/chatgpt%20codex%20use/.repos/oracle/docs/install.md).
 
 ## 1. Pick a mode
 
