@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import chalk from "chalk";
 import type { BrowserSessionConfig } from "../sessionStore.js";
 import type { ModelName, ThinkingTimeLevel } from "../oracle/types.js";
 import { normalizeThinkingTimeLevel } from "../oracle/thinkingTime.js";
@@ -79,7 +80,7 @@ export interface BrowserFlagOptions {
   browserManualLoginProfileDir?: string | null;
   copyProfile?: string;
   remoteHost?: string;
-  /** Thinking time intensity: 'light', 'standard', 'extended', 'heavy' */
+  /** Thinking time intensity: 'light', 'standard', 'extended', 'extra-high', 'heavy' */
   browserThinkingTime?: ThinkingTimeLevel;
   browserResearch?: BrowserResearchMode;
   browserArchive?: BrowserArchiveMode;
@@ -164,6 +165,7 @@ export async function buildBrowserConfig(
     !isChatGptModel && normalizedOverride.length > 0 && normalizedOverride !== baseModel;
   const modelStrategy =
     normalizeBrowserModelStrategy(options.browserModelStrategy) ?? DEFAULT_MODEL_STRATEGY;
+  assertBrowserModelAvailable(options.model, modelStrategy);
   const cookieNames = parseCookieNames(
     options.browserCookieNames ?? process.env.ORACLE_BROWSER_COOKIE_NAMES,
   );
@@ -206,38 +208,62 @@ export async function buildBrowserConfig(
     url,
     debugPort: selectBrowserPort(options),
     timeoutMs: options.browserTimeout
-      ? parseDuration(options.browserTimeout, DEFAULT_BROWSER_TIMEOUT_MS)
+      ? parseBrowserDuration(
+          options.browserTimeout,
+          "--browser-timeout",
+          DEFAULT_BROWSER_TIMEOUT_MS,
+        )
       : undefined,
     inputTimeoutMs: options.browserInputTimeout
-      ? parseDuration(options.browserInputTimeout, DEFAULT_BROWSER_INPUT_TIMEOUT_MS)
+      ? parseBrowserDuration(
+          options.browserInputTimeout,
+          "--browser-input-timeout",
+          DEFAULT_BROWSER_INPUT_TIMEOUT_MS,
+        )
       : undefined,
     attachmentTimeoutMs: options.browserAttachmentTimeout
-      ? parseDuration(options.browserAttachmentTimeout, DEFAULT_BROWSER_ATTACHMENT_TIMEOUT_MS)
+      ? parseBrowserDuration(
+          options.browserAttachmentTimeout,
+          "--browser-attachment-timeout",
+          DEFAULT_BROWSER_ATTACHMENT_TIMEOUT_MS,
+        )
       : undefined,
     assistantRecheckDelayMs: options.browserRecheckDelay
-      ? parseDuration(options.browserRecheckDelay, 0)
+      ? parseBrowserDuration(options.browserRecheckDelay, "--browser-recheck-delay", 0)
       : undefined,
     assistantRecheckTimeoutMs: options.browserRecheckTimeout
-      ? parseDuration(options.browserRecheckTimeout, DEFAULT_BROWSER_RECHECK_TIMEOUT_MS)
+      ? parseBrowserDuration(
+          options.browserRecheckTimeout,
+          "--browser-recheck-timeout",
+          DEFAULT_BROWSER_RECHECK_TIMEOUT_MS,
+        )
       : undefined,
     reuseChromeWaitMs: options.browserReuseWait
-      ? parseDuration(options.browserReuseWait, 0)
+      ? parseBrowserDuration(options.browserReuseWait, "--browser-reuse-wait", 0)
       : undefined,
     profileLockTimeoutMs: options.browserProfileLockTimeout
-      ? parseDuration(options.browserProfileLockTimeout, 0)
+      ? parseBrowserDuration(options.browserProfileLockTimeout, "--browser-profile-lock-timeout", 0)
       : undefined,
     maxConcurrentTabs: parseMaxConcurrentTabs(options.browserMaxConcurrentTabs),
     autoReattachDelayMs: options.browserAutoReattachDelay
-      ? parseDuration(options.browserAutoReattachDelay, 0)
+      ? parseBrowserDuration(options.browserAutoReattachDelay, "--browser-auto-reattach-delay", 0)
       : undefined,
     autoReattachIntervalMs: options.browserAutoReattachInterval
-      ? parseDuration(options.browserAutoReattachInterval, 0)
+      ? parseBrowserDuration(
+          options.browserAutoReattachInterval,
+          "--browser-auto-reattach-interval",
+          0,
+        )
       : undefined,
     autoReattachTimeoutMs: options.browserAutoReattachTimeout
-      ? parseDuration(options.browserAutoReattachTimeout, DEFAULT_BROWSER_AUTO_REATTACH_TIMEOUT_MS)
+      ? parseBrowserDuration(
+          options.browserAutoReattachTimeout,
+          "--browser-auto-reattach-timeout",
+          DEFAULT_BROWSER_AUTO_REATTACH_TIMEOUT_MS,
+        )
       : undefined,
     cookieSyncWaitMs: options.browserCookieWait
-      ? parseDuration(options.browserCookieWait, 0)
+      ? parseBrowserDuration(options.browserCookieWait, "--browser-cookie-wait", 0)
       : undefined,
     cookieSync: options.browserNoCookieSync ? false : undefined,
     cookieNames,
@@ -260,6 +286,21 @@ export async function buildBrowserConfig(
     researchMode: options.browserResearch === "deep" ? "deep" : "off",
     archiveConversations: options.browserArchive,
   };
+}
+
+function assertBrowserModelAvailable(model: ModelName, modelStrategy: BrowserModelStrategy): void {
+  if (modelStrategy !== "select") return;
+  const normalized = normalizeChatGptModelForBrowser(model);
+  if (
+    normalized !== "gpt-5.2" &&
+    normalized !== "gpt-5.2-instant" &&
+    normalized !== "gpt-5.2-thinking"
+  ) {
+    return;
+  }
+  throw new Error(
+    `Browser model "${model}" is retired because ChatGPT no longer offers GPT-5.2 base, Instant, or Thinking. Choose a current GPT-5.5/GPT-5.6 browser model, use --browser-model-strategy current to keep ChatGPT's active model, or use --engine api to retain the GPT-5.2 API alias.`,
+  );
 }
 
 function validateAttachRunningOptions(
@@ -313,6 +354,17 @@ function parseMaxConcurrentTabs(raw?: string): number | undefined {
     throw new Error(`Invalid browser max concurrent tabs: ${raw}. Expected a positive integer.`);
   }
   return Math.trunc(value);
+}
+
+function parseBrowserDuration(raw: string, optionName: string, fallbackMs: number): number {
+  const parsed = parseDuration(raw, Number.NaN);
+  if (Number.isFinite(parsed)) return parsed;
+  console.log(
+    chalk.yellow(
+      `Warning: invalid ${optionName} duration "${raw}"; using fallback ${fallbackMs}ms.`,
+    ),
+  );
+  return fallbackMs;
 }
 
 export function mapModelToBrowserLabel(model: ModelName): string {

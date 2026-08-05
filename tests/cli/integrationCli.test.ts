@@ -4,6 +4,7 @@ import path from "node:path";
 import os from "node:os";
 import { pathToFileURL } from "node:url";
 import {
+  type ChildProcess,
   type ChildProcessByStdio,
   execFile,
   spawn,
@@ -68,7 +69,7 @@ function execCli(
 type CliChild = ChildProcessByStdio<null, Readable, Readable>;
 
 function waitForChildExit(
-  child: CliChild,
+  child: ChildProcess,
   timeoutMs: number,
 ): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
   return new Promise((resolve, reject) => {
@@ -102,6 +103,30 @@ function waitForChildOutput(child: CliChild, timeoutMs: number): Promise<void> {
 }
 
 describe("oracle CLI integration", () => {
+  test(
+    "exits nonzero when a detached worker receives an unknown session id",
+    async () => {
+      const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-missing-session-"));
+      const result = await execCli(["--exec-session", "missing-session"], {
+        env: {
+          ...process.env,
+          // biome-ignore lint/style/useNamingConvention: env var name
+          ORACLE_HOME_DIR: oracleHome,
+          // biome-ignore lint/style/useNamingConvention: env var name
+          ORACLE_DISABLE_KEYTAR: "1",
+        },
+        timeout: INTEGRATION_TIMEOUT,
+      });
+
+      expect(result.code).toBe(1);
+      expect(`${result.stdout}\n${result.stderr}`).toContain(
+        "No session found with ID missing-session",
+      );
+      await rm(oracleHome, { recursive: true, force: true });
+    },
+    INTEGRATION_TIMEOUT,
+  );
+
   test(
     "exits nonzero when root options omit the required prompt",
     async () => {
@@ -406,7 +431,7 @@ module.exports = () => ({
       );
 
       expect(stdout).toContain("[preview] Oracle");
-      expect(stdout).toContain("browser mode (gemini-3.1-pro)");
+      expect(stdout).toContain("browser mode (target=Gemini 3.1 Pro; requested=gemini-3.1-pro)");
 
       await rm(oracleHome, { recursive: true, force: true });
     },
@@ -448,13 +473,13 @@ module.exports = () => ({
           "--prompt",
           "Engine browser route check",
           "--model",
-          "gpt-5.1",
+          "gpt-5.4",
         ],
         { env },
       );
 
       expect(stdout).toContain("[preview] Oracle");
-      expect(stdout).toContain("browser mode (gpt-5.1)");
+      expect(stdout).toContain("browser mode (target=Thinking 5.4; requested=gpt-5.4)");
       expect(stdout).not.toContain("Provider: Azure OpenAI");
 
       await rm(oracleHome, { recursive: true, force: true });
@@ -495,13 +520,13 @@ module.exports = () => ({
           "--prompt",
           "Project browser route check",
           "--model",
-          "gpt-5.1",
+          "gpt-5.4",
         ],
         { env, cwd: repoDir },
       );
 
       expect(stdout).toContain("[preview] Oracle");
-      expect(stdout).toContain("browser mode (gpt-5.1)");
+      expect(stdout).toContain("browser mode (target=Thinking 5.4; requested=gpt-5.4)");
       expect(stdout).not.toContain("Provider: Azure OpenAI");
 
       await rm(oracleHome, { recursive: true, force: true });
@@ -963,6 +988,104 @@ module.exports = () => ({
   );
 
   test(
+    "waits for the parent lifecycle handoff before a detached worker starts",
+    async () => {
+      const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-detached-gate-"));
+      const env = {
+        ...process.env,
+        // biome-ignore lint/style/useNamingConvention: env var name
+        OPENAI_API_KEY: "sk-integration",
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_HOME_DIR: oracleHome,
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_CLIENT_FACTORY: CLIENT_FACTORY,
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_NO_DETACH: "1",
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_DISABLE_KEYTAR: "1",
+      };
+
+      await execFileAsync(
+        process.execPath,
+        ["--import", "tsx", CLI_ENTRY, "--prompt", "Gated worker", "--model", "gpt-5.1"],
+        { env },
+      );
+      const sessionsDir = path.join(oracleHome, "sessions");
+      const [sessionId] = await readdir(sessionsDir);
+      const metadataPath = path.join(sessionsDir, sessionId, "meta.json");
+      const metadata = JSON.parse(await readFile(metadataPath, "utf8"));
+      await writeFile(
+        metadataPath,
+        JSON.stringify({ ...metadata, status: "pending", completedAt: undefined }, null, 2),
+      );
+
+      const child = spawn(
+        process.execPath,
+        ["--import", "tsx", CLI_ENTRY, "--exec-session", sessionId],
+        {
+          env: {
+            ...env,
+            // biome-ignore lint/style/useNamingConvention: env var name
+            ORACLE_DETACHED_START_GATE: "1",
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(JSON.parse(await readFile(metadataPath, "utf8")).status).toBe("pending");
+
+      child.stdin.end();
+      await expect(waitForChildExit(child, INTEGRATION_TIMEOUT)).resolves.toEqual({
+        code: 1,
+        signal: null,
+      });
+      expect(JSON.parse(await readFile(metadataPath, "utf8")).status).toBe("pending");
+
+      const readyChild = spawn(
+        process.execPath,
+        ["--import", "tsx", CLI_ENTRY, "--exec-session", sessionId],
+        {
+          env: {
+            ...env,
+            // biome-ignore lint/style/useNamingConvention: env var name
+            ORACLE_DETACHED_START_GATE: "1",
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+      );
+      await writeFile(
+        metadataPath,
+        JSON.stringify(
+          {
+            ...metadata,
+            status: "pending",
+            completedAt: undefined,
+            lifecycle: {
+              engine: "api",
+              execution: "background",
+              attached: false,
+              detached: true,
+              workerPid: readyChild.pid,
+              reattachCommand: `oracle session ${sessionId}`,
+            },
+          },
+          null,
+          2,
+        ),
+      );
+      readyChild.stdin.end("ready\n");
+      await expect(waitForChildExit(readyChild, INTEGRATION_TIMEOUT)).resolves.toEqual({
+        code: 0,
+        signal: null,
+      });
+      expect(JSON.parse(await readFile(metadataPath, "utf8")).status).toBe("completed");
+
+      await rm(oracleHome, { recursive: true, force: true });
+    },
+    INTEGRATION_TIMEOUT,
+  );
+
+  test(
     "persists model overrides for detached --exec-session runs",
     async () => {
       const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-model-overrides-"));
@@ -1017,6 +1140,73 @@ module.exports = () => ({
             ORACLE_TEST_REQUIRE_REASONING_EFFORT: "xhigh",
           },
         },
+      );
+      const rerunMetadata = JSON.parse(
+        await readFile(path.join(sessionsDir, sessionId, "meta.json"), "utf8"),
+      );
+      expect(rerunMetadata.status).toBe("completed");
+
+      await rm(oracleHome, { recursive: true, force: true });
+    },
+    INTEGRATION_TIMEOUT,
+  );
+
+  test(
+    "forwards and persists GPT-5.6 Pro reasoning mode",
+    async () => {
+      const oracleHome = await mkdtemp(path.join(os.tmpdir(), "oracle-reasoning-mode-"));
+      const env = {
+        ...process.env,
+        // biome-ignore lint/style/useNamingConvention: env var name
+        OPENAI_API_KEY: "sk-integration",
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_HOME_DIR: oracleHome,
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_CLIENT_FACTORY: CLIENT_FACTORY,
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_NO_DETACH: "1",
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_DISABLE_KEYTAR: "1",
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_TEST_REQUIRE_REASONING_MODE: "pro",
+        // biome-ignore lint/style/useNamingConvention: env var name
+        ORACLE_TEST_REQUIRE_REASONING_EFFORT: "max",
+      };
+
+      await execFileAsync(
+        process.execPath,
+        [
+          "--import",
+          "tsx",
+          CLI_ENTRY,
+          "--engine",
+          "api",
+          "--model",
+          "gpt-5.6-sol",
+          "--reasoning-effort",
+          "max",
+          "--reasoning-mode",
+          "pro",
+          "--no-background",
+          "--wait",
+          "--prompt",
+          "Verify GPT-5.6 Pro reasoning mode",
+        ],
+        { env },
+      );
+
+      const sessionsDir = path.join(oracleHome, "sessions");
+      const [sessionId] = await readdir(sessionsDir);
+      const metadata = JSON.parse(
+        await readFile(path.join(sessionsDir, sessionId, "meta.json"), "utf8"),
+      );
+      expect(metadata.options?.reasoningEffort).toBe("max");
+      expect(metadata.options?.reasoningMode).toBe("pro");
+
+      await execFileAsync(
+        process.execPath,
+        ["--import", "tsx", CLI_ENTRY, "--exec-session", sessionId],
+        { env },
       );
       const rerunMetadata = JSON.parse(
         await readFile(path.join(sessionsDir, sessionId, "meta.json"), "utf8"),

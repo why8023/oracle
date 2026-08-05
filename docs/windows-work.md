@@ -8,6 +8,7 @@ Read this file whenever you're working from Windows and add new findings so the 
 - browser-tools binary: not built in `agent-scripts/bin` on Windows; `pnpm tsx scripts/browser-tools.ts` also fails there (no package manifest). Use a macOS-built binary or run from macOS if you need it.
 - Prefer PowerShell + pnpm directly; watch for CRLF warnings when touching tracked files.
 - Keep pnpm's project-local virtual store on Windows. `enableGlobalVirtualStore` links worktrees into the shared `%LOCALAPPDATA%\\pnpm\\store\\v10\\links` tree; removing a temporary Git worktree can mutate that shared store and break later installs. If this happens, confirm with `pnpm store status` and repair with a frozen `pnpm install --force` through mise + Corepack.
+- WSL browser launch host detection: a systemd-resolved stub such as `nameserver 127.0.0.53` is guest loopback, not the Windows host. Keep resolver-derived non-loopback hosts for Windows Chrome compatibility, but route resolver-derived `127/8` values to the standard local Chrome launcher.
 
 Future Windows gotchas belong here. Update this doc when you learn something new.
 

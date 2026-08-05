@@ -23,6 +23,8 @@ import type {
   ModelName,
   ModelOverridesConfig,
   PreviewMode,
+  ReasoningEffort,
+  ReasoningMode,
   RunOracleOptions,
 } from "../src/oracle/types.js";
 import { CHATGPT_URL } from "../src/browser/constants.js";
@@ -49,7 +51,7 @@ import {
 } from "../src/cli/options.js";
 import { copyToClipboard } from "../src/cli/clipboard.js";
 import { buildMarkdownBundle } from "../src/cli/markdownBundle.js";
-import { shouldDetachSession } from "../src/cli/detach.js";
+import { shouldDetachSession, stopDetachedWorker } from "../src/cli/detach.js";
 import { applyHiddenAliases } from "../src/cli/hiddenAliases.js";
 import type { BrowserSessionRunnerDeps } from "../src/browser/sessionRunner.js";
 import { isMediaFile } from "../src/browser/prompt.js";
@@ -96,6 +98,8 @@ interface CliOptions extends OptionValues {
   render?: boolean;
   model: string;
   models?: string[];
+  reasoningEffort?: ReasoningEffort;
+  reasoningMode?: ReasoningMode;
   force?: boolean;
   slug?: string;
   filesReport?: boolean;
@@ -146,7 +150,7 @@ interface CliOptions extends OptionValues {
   browserManualLogin?: boolean;
   browserManualLoginProfileDir?: string;
   copyProfile?: string;
-  browserThinkingTime?: "light" | "standard" | "extended" | "heavy";
+  browserThinkingTime?: "light" | "standard" | "extended" | "extra-high" | "heavy";
   browserResearch?: "off" | "deep";
   browserFollowUp?: string[];
   browserAllowCookieErrors?: boolean;
@@ -435,7 +439,7 @@ program
   .option("-s, --slug <words>", "Custom session slug (3-5 words).")
   .option(
     "-m, --model <model>",
-    'Model to target (gpt-5.5-pro default). GPT-5.6 aliases: gpt-5.6 and gpt-5.6-sol (OpenAI API or ChatGPT browser). Also gpt-5.5, gpt-5.4-pro, gpt-5.4, gpt-5.1-pro, gpt-5-pro, gpt-5.1, gpt-5.1-codex API-only, gpt-5.2, gpt-5.2-instant, gpt-5.2-pro, gemini-3.1-flash-lite, gemini-3.5-flash, gemini-3.1-pro, legacy gemini-3-pro, claude-4.6-sonnet, claude-4.1-opus, or ChatGPT labels like "5.5 Pro" / "5.2 Thinking" for browser runs).',
+    "Model to target (gpt-5.5-pro default). GPT-5.6 aliases gpt-5.6 and gpt-5.6-sol work with the OpenAI API or ChatGPT browser. Browser mode also supports current GPT-5.5/GPT-5.4 targets and legacy Pro aliases; retired GPT-5.2 base/Instant/Thinking aliases are API-only. Other API targets include gpt-5.1-codex, gpt-5.2, gpt-5.2-instant, Gemini, Claude, and custom model IDs.",
     normalizeModelOption,
   )
   .addOption(
@@ -445,6 +449,22 @@ program
     )
       .argParser(collectModelList)
       .default([]),
+  )
+  .addOption(
+    new Option("--reasoning-effort <effort>", "Reasoning effort for GPT-5.6 API models.").choices([
+      "none",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]),
+  )
+  .addOption(
+    new Option(
+      "--reasoning-mode <mode>",
+      'Responses API reasoning execution mode for GPT-5.6 models ("standard" or "pro").',
+    ).choices(["standard", "pro"]),
   )
   .addOption(
     new Option(
@@ -781,7 +801,7 @@ program
   .addOption(
     new Option(
       "--browser-thinking-time <level>",
-      "Thinking time intensity for Thinking/Pro models: light, standard, extended, heavy, or ChatGPT UI aliases.",
+      "Thinking time intensity for Thinking/Pro models: light, standard, extended, extra-high (Extra High), heavy (Pro), or ChatGPT UI aliases.",
     )
       .argParser(parseThinkingTimeOption)
       .hideHelp(),
@@ -1326,6 +1346,8 @@ function buildRunOptions(
     prompt: options.prompt,
     model: options.model,
     models: overrides.models ?? options.models,
+    reasoningEffort: overrides.reasoningEffort ?? options.reasoningEffort,
+    reasoningMode: overrides.reasoningMode ?? options.reasoningMode,
     previousResponseId: overrides.previousResponseId ?? options.previousResponseId,
     browserResumeConversationUrl:
       overrides.browserResumeConversationUrl ?? options.browserResumeConversationUrl,
@@ -1636,6 +1658,8 @@ function buildRunOptionsFromMetadata(metadata: SessionMetadata): RunOracleOption
     browserResumeConversationUrl: stored.browserResumeConversationUrl,
     effectiveModelId: stored.effectiveModelId ?? stored.model,
     modelOverrides: stored.modelOverrides,
+    reasoningEffort: stored.reasoningEffort,
+    reasoningMode: stored.reasoningMode,
     file: stored.file ?? [],
     maxFileSizeBytes: stored.maxFileSizeBytes,
     slug: stored.slug,
@@ -1663,6 +1687,8 @@ function buildRunOptionsFromMetadata(metadata: SessionMetadata): RunOracleOption
     browserInlineFiles: stored.browserInlineFiles,
     browserBundleFiles: stored.browserBundleFiles,
     browserBundleFormat: stored.browserBundleFormat,
+    generateImage: stored.generateImage,
+    outputPath: stored.outputPath,
     browserFollowUps: stored.browserFollowUps,
     background: stored.background,
     renderPlain: stored.renderPlain,
@@ -1999,6 +2025,7 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   }
 
   if (options.execSession) {
+    await waitForDetachedStartGate();
     await executeSession(options.execSession);
     return;
   }
@@ -2094,6 +2121,12 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     }
   }
   const activeModel = resolvedOptions.model;
+  if (options.reasoningMode && engine !== "api") {
+    throw new Error("--reasoning-mode requires --engine api.");
+  }
+  if (options.reasoningEffort && engine !== "api") {
+    throw new Error("--reasoning-effort requires --engine api.");
+  }
 
   const browserFollowUpCount =
     options.browserFollowUp?.filter((entry) => entry.trim().length > 0).length ?? 0;
@@ -2265,13 +2298,16 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     return;
   }
 
-  // Decide whether to block until completion:
+  // Decide whether the original CLI stays attached until completion:
   // - explicit --wait / --no-wait wins
-  // - otherwise block for fast models (gpt-5.1, browser) and detach by default for pro API runs
+  // - otherwise stay attached for fast models and browser runs
+  // Local Pro browser work may still use a detached worker so CLI interruption
+  // cannot terminate the browser controller.
   let waitPreference = resolveWaitFlag({
     waitFlag: options.wait,
     model: activeModel,
     engine,
+    reasoningMode: resolvedOptions.reasoningMode,
   });
   if (remoteHost && waitPreference === false) {
     console.log(chalk.dim("Remote browser runs require --wait; ignoring --no-wait."));
@@ -2325,24 +2361,36 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     : shouldDetachSession({
         engine,
         model: activeModel,
+        reasoningMode: resolvedOptions.reasoningMode,
         waitPreference,
         disableDetachEnv,
       });
-  const detached = !detachAllowed
-    ? false
-    : await launchDetachedSession(sessionMeta.id).catch((error) => {
+  let lifecycle = buildSessionLifecycle({
+    engine,
+    detached: false,
+    reattachCommand: `oracle session ${sessionMeta.id}`,
+  });
+  const workerPid = !detachAllowed
+    ? undefined
+    : await launchDetachedSession(sessionMeta.id, async (pid) => {
+        lifecycle = buildSessionLifecycle({
+          engine,
+          detached: true,
+          workerPid: pid,
+          reattachCommand: `oracle session ${sessionMeta.id}`,
+        });
+        await sessionStore.updateSession(sessionMeta.id, { lifecycle });
+      }).catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
         console.log(
           chalk.yellow(`Unable to detach session runner (${message}). Running inline...`),
         );
-        return false;
+        return undefined;
       });
-  const lifecycle = buildSessionLifecycle({
-    engine,
-    detached,
-    reattachCommand: `oracle session ${sessionMeta.id}`,
-  });
-  await sessionStore.updateSession(sessionMeta.id, { lifecycle });
+  const detached = workerPid !== undefined;
+  if (!detached) {
+    await sessionStore.updateSession(sessionMeta.id, { lifecycle });
+  }
   const sessionWithLifecycle: SessionMetadata = { ...sessionMeta, lifecycle };
 
   if (!waitPreference) {
@@ -2376,8 +2424,7 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   }
   if (detached) {
     console.log(chalk.blue(`Reattach via: oracle session ${sessionMeta.id}`));
-    const { attachSession } = await import("../src/cli/sessionDisplay.js");
-    await attachSession(sessionMeta.id, { suppressMetadata: true });
+    await attachToDetachedSession(sessionMeta.id, workerPid);
   }
 }
 
@@ -2448,25 +2495,85 @@ async function runInteractiveSession(
   }
 }
 
-async function launchDetachedSession(sessionId: string): Promise<boolean> {
+async function launchDetachedSession(
+  sessionId: string,
+  prepare: (pid: number) => Promise<void>,
+): Promise<number> {
   return new Promise((resolve, reject) => {
     try {
       const args = ["--", CLI_ENTRYPOINT, "--exec-session", sessionId];
-      const env = buildDetachedPerfTraceEnv(process.env, perfTraceArgs.value, sessionId);
+      const env = {
+        ...buildDetachedPerfTraceEnv(process.env, perfTraceArgs.value, sessionId),
+        ORACLE_DETACHED_START_GATE: "1",
+      };
       const child = spawn(process.execPath, args, {
         detached: true,
-        stdio: "ignore",
+        stdio: ["pipe", "ignore", "ignore"],
         env,
       });
       child.once("error", reject);
-      child.once("spawn", () => {
-        child.unref();
-        resolve(true);
+      child.once("spawn", async () => {
+        if (child.pid === undefined) {
+          reject(new Error("Detached session worker started without a process ID."));
+          return;
+        }
+        try {
+          await prepare(child.pid);
+          child.stdin.end("ready\n");
+          child.unref();
+          resolve(child.pid);
+        } catch (error) {
+          child.kill();
+          reject(error);
+        }
       });
     } catch (error) {
       reject(error);
     }
   });
+}
+
+async function waitForDetachedStartGate(): Promise<void> {
+  if (process.env.ORACLE_DETACHED_START_GATE !== "1") {
+    return;
+  }
+  const chunks: Buffer[] = [];
+  await new Promise<void>((resolve, reject) => {
+    process.stdin.on("data", (chunk: Buffer) => chunks.push(chunk));
+    process.stdin.once("end", resolve);
+    process.stdin.once("error", reject);
+    process.stdin.resume();
+  });
+  if (Buffer.concat(chunks).toString("utf8") !== "ready\n") {
+    throw new Error("Detached session worker start gate closed before lifecycle handoff.");
+  }
+}
+
+async function attachToDetachedSession(sessionId: string, workerPid: number): Promise<void> {
+  let cancelled = false;
+  const cancelWorker = (): void => {
+    cancelled = true;
+    try {
+      stopDetachedWorker(workerPid);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(chalk.red(`Unable to stop detached worker ${workerPid}: ${message}`));
+    }
+  };
+  process.once("SIGINT", cancelWorker);
+  try {
+    const { attachSession } = await import("../src/cli/sessionDisplay.js");
+    await attachSession(sessionId, {
+      suppressMetadata: true,
+      renderPrompt: false,
+      propagateFailure: true,
+    });
+  } finally {
+    process.off("SIGINT", cancelWorker);
+    if (cancelled) {
+      process.exitCode = 130;
+    }
+  }
 }
 
 async function restartSession(sessionId: string, options: RestartCommandOptions): Promise<void> {
@@ -2518,6 +2625,7 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
     storedPreference: storedOptions.waitPreference,
     model: runOptions.model,
     engine,
+    reasoningMode: runOptions.reasoningMode,
   });
 
   const remoteConfig = resolveRemoteServiceConfig({
@@ -2607,24 +2715,36 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
     : shouldDetachSession({
         engine,
         model: runOptions.model,
+        reasoningMode: runOptions.reasoningMode,
         waitPreference,
         disableDetachEnv,
       });
-  const detached = !detachAllowed
-    ? false
-    : await launchDetachedSession(sessionMeta.id).catch((error) => {
+  let lifecycle = buildSessionLifecycle({
+    engine,
+    detached: false,
+    reattachCommand: `oracle session ${sessionMeta.id}`,
+  });
+  const workerPid = !detachAllowed
+    ? undefined
+    : await launchDetachedSession(sessionMeta.id, async (pid) => {
+        lifecycle = buildSessionLifecycle({
+          engine,
+          detached: true,
+          workerPid: pid,
+          reattachCommand: `oracle session ${sessionMeta.id}`,
+        });
+        await sessionStore.updateSession(sessionMeta.id, { lifecycle });
+      }).catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
         console.log(
           chalk.yellow(`Unable to detach session runner (${message}). Running inline...`),
         );
-        return false;
+        return undefined;
       });
-  const lifecycle = buildSessionLifecycle({
-    engine,
-    detached,
-    reattachCommand: `oracle session ${sessionMeta.id}`,
-  });
-  await sessionStore.updateSession(sessionMeta.id, { lifecycle });
+  const detached = workerPid !== undefined;
+  if (!detached) {
+    await sessionStore.updateSession(sessionMeta.id, { lifecycle });
+  }
   const sessionWithLifecycle: SessionMetadata = { ...sessionMeta, lifecycle };
 
   if (!waitPreference) {
@@ -2659,29 +2779,34 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
   }
   if (detached) {
     console.log(chalk.blue(`Reattach via: oracle session ${sessionMeta.id}`));
-    const { attachSession } = await import("../src/cli/sessionDisplay.js");
-    await attachSession(sessionMeta.id, { suppressMetadata: true });
+    await attachToDetachedSession(sessionMeta.id, workerPid);
   }
 }
 
 async function executeSession(sessionId: string) {
-  const metadata = await sessionStore.readSession(sessionId);
-  if (!metadata) {
-    console.error(chalk.red(`No session found with ID ${sessionId}`));
-    process.exitCode = 1;
-    return;
-  }
-  const runOptions = buildRunOptionsFromMetadata(metadata);
-  const sessionMode = getSessionMode(metadata);
-  const browserConfig = getBrowserConfigFromMetadata(metadata);
-  const { logLine, writeChunk, stream } = sessionStore.createLogWriter(sessionId);
-  const userConfig = (await loadUserConfig()).config;
-  const notifications = deriveNotificationSettingsFromMetadata(
-    metadata,
-    process.env,
-    userConfig.notify,
-  );
+  let metadata: SessionMetadata | null = null;
+  let writer: ReturnType<typeof sessionStore.createLogWriter> | null = null;
   try {
+    metadata = await sessionStore.readSession(sessionId);
+    if (!metadata) {
+      throw new Error(`No session found with ID ${sessionId}`);
+    }
+    if (
+      process.env.ORACLE_DETACHED_START_GATE === "1" &&
+      metadata.lifecycle?.workerPid !== process.pid
+    ) {
+      throw new Error("Detached session worker started without a matching lifecycle handoff.");
+    }
+    const runOptions = buildRunOptionsFromMetadata(metadata);
+    const sessionMode = getSessionMode(metadata);
+    const browserConfig = getBrowserConfigFromMetadata(metadata);
+    writer = sessionStore.createLogWriter(sessionId);
+    const userConfig = (await loadUserConfig()).config;
+    const notifications = deriveNotificationSettingsFromMetadata(
+      metadata,
+      process.env,
+      userConfig.notify,
+    );
     const { performSessionRun } = await import("../src/cli/sessionRunner.js");
     await performSessionRun({
       sessionMeta: metadata,
@@ -2689,15 +2814,34 @@ async function executeSession(sessionId: string) {
       mode: sessionMode,
       browserConfig,
       cwd: metadata.cwd ?? process.cwd(),
-      log: logLine,
-      write: writeChunk,
+      log: writer.logLine,
+      write: writer.writeChunk,
       version: VERSION,
       notifications,
     });
-  } catch {
-    // Errors are already logged to the session log; keep quiet to mirror stored-session behavior.
+  } catch (error) {
+    process.exitCode = 1;
+    const message = error instanceof Error ? error.message : String(error);
+    if (!metadata) {
+      console.error(chalk.red(message));
+      return;
+    }
+    writer?.logLine(`ERROR: Detached session worker failed: ${message}`);
+    const latest = await sessionStore.readSession(sessionId).catch(() => null);
+    if (latest && !["completed", "partial", "error"].includes(latest.status)) {
+      await sessionStore.updateSession(sessionId, {
+        status: "error",
+        completedAt: new Date().toISOString(),
+        errorMessage: message,
+        response: { status: "error" },
+        error: {
+          category: "internal",
+          message,
+        },
+      });
+    }
   } finally {
-    stream.end();
+    writer?.stream.end();
   }
 }
 
@@ -2773,14 +2917,16 @@ function resolveWaitFlag({
   waitFlag,
   model,
   engine,
+  reasoningMode,
 }: {
   waitFlag?: boolean;
   model: ModelName;
   engine: EngineMode;
+  reasoningMode?: ReasoningMode;
 }): boolean {
   if (waitFlag === true) return true;
   if (waitFlag === false) return false;
-  return defaultWaitPreference(model, engine);
+  return defaultWaitPreference(model, engine, reasoningMode);
 }
 
 function resolveRestartWaitPreference({
@@ -2788,16 +2934,18 @@ function resolveRestartWaitPreference({
   storedPreference,
   model,
   engine,
+  reasoningMode,
 }: {
   waitFlag?: boolean;
   storedPreference?: boolean;
   model: ModelName;
   engine: EngineMode;
+  reasoningMode?: ReasoningMode;
 }): boolean {
   if (waitFlag === true) return true;
   if (waitFlag === false) return false;
   if (typeof storedPreference === "boolean") return storedPreference;
-  return defaultWaitPreference(model, engine);
+  return defaultWaitPreference(model, engine, reasoningMode);
 }
 
 function resolveEffectiveModelIdForRun(model: ModelName, stored?: string): string {

@@ -989,17 +989,26 @@ describe("browser model selection matchers", () => {
     expect(result).toBeInstanceOf(Promise);
   });
 
-  it("keeps base Sol distinct from the Pro target", () => {
+  it("keeps an inline Sol Pro model label distinct", () => {
     const inlinePro = evaluateImmediateModelSelectionExpression("GPT-5.6 Sol", "GPT-5.6 Sol Pro");
     expect(inlinePro).toBeInstanceOf(Promise);
+  });
 
-    const separateProPill = evaluateImmediateModelSelectionExpression(
-      "GPT-5.6 Sol",
-      "GPT-5.6 Sol",
-      "5.6 Sol",
-      "Pro",
-    );
-    expect(separateProPill).toBeInstanceOf(Promise);
+  it("accepts GPT-5.6 Sol with an independent Pro effort pill", () => {
+    expect(
+      evaluateImmediateModelSelectionExpression("GPT-5.6 Sol", "GPT-5.6 Sol", "5.6 Sol", "Pro"),
+    ).toEqual({ status: "already-selected", label: "GPT-5.6 Sol" });
+  });
+
+  it("accepts an aggregated Sol label only with an independent Pro effort pill", () => {
+    expect(
+      evaluateImmediateModelSelectionExpression(
+        "GPT-5.6 Sol",
+        "GPT-5.6 Sol Pro",
+        "GPT-5.6 Sol Pro",
+        "Pro",
+      ),
+    ).toEqual({ status: "already-selected", label: "GPT-5.6 Sol" });
   });
 
   it("includes real pointer coordinates when opening version submenus", () => {
@@ -1173,14 +1182,14 @@ describe("browser model selection matchers", () => {
     expect(result).toEqual({ status: "already-selected", label: "Pro" });
   });
 
-  it("accepts a Pro pill plus effort label as the current Pro model", () => {
+  it("uses the observed Pro pill instead of its effort label as the current model", () => {
     const result = evaluateImmediateModelSelectionExpression(
       "gpt-5.5-pro",
       "Extended",
       "",
       "Pro, click to remove",
     );
-    expect(result).toEqual({ status: "already-selected", label: "Extended + Pro" });
+    expect(result).toEqual({ status: "already-selected", label: "Pro" });
   });
 
   it("hard-rejects Thinking candidates when targeting Pro", () => {
@@ -1234,9 +1243,9 @@ describe("browser model selection matchers", () => {
     expect(result).toEqual({ status: "already-selected", label: "Thinking Heavy" });
   });
 
-  it("finds the new effort-only composer pill when ChatGPT omits aria-haspopup", () => {
+  it("does not treat an effort-only composer pill as a model label when aria-haspopup is absent", () => {
     const result = evaluateComposerPillFallbackExpression("Thinking 5.5", "Extra High", "current");
-    expect(result).toEqual({ status: "already-selected", label: "Extra High" });
+    expect(result).toEqual({ status: "already-selected", label: null });
   });
 
   it("allows the explicit current strategy when ChatGPT hides the model picker", () => {
@@ -1417,6 +1426,46 @@ describe("browser model selection matchers", () => {
     expect(logger).toHaveBeenCalledWith("Model picker: current model (label unavailable)");
   });
 
+  it("does not promote the requested picker target to verified evidence without a label", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: { value: { status: "already-selected", label: null } },
+      }),
+    };
+    const logger = vi.fn();
+
+    await expect(
+      ensureModelSelection(runtime as never, "gpt-5.5-pro", logger as never, "select"),
+    ).resolves.toMatchObject({
+      requestedModel: "gpt-5.5-pro",
+      resolvedLabel: null,
+      status: "already-selected",
+      strategy: "select",
+      verified: false,
+    });
+    expect(logger).toHaveBeenCalledWith("Model picker: current model (label unavailable)");
+  });
+
+  it("does not reject GPT-5.6 Sol when the picker reports success without a label", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: { value: { status: "already-selected", label: null } },
+      }),
+    };
+    const logger = vi.fn();
+
+    await expect(
+      ensureModelSelection(runtime as never, "gpt-5.6-sol", logger as never, "select"),
+    ).resolves.toMatchObject({
+      requestedModel: "gpt-5.6-sol",
+      resolvedLabel: null,
+      status: "already-selected",
+      strategy: "select",
+      verified: false,
+    });
+    expect(logger).toHaveBeenCalledWith("Model picker: current model (label unavailable)");
+  });
+
   it("builds composer footer matchers for generic ChatGPT header states", () => {
     expect(buildComposerSignalMatchersForTest("GPT-5.5 Pro")).toEqual({
       includesAny: ["pro"],
@@ -1433,6 +1482,12 @@ describe("browser model selection matchers", () => {
       excludesAny: ["thinking", "pro"],
       allowBlank: false,
     });
+  });
+
+  it("does not use the picker target as a DOM resolved-label fallback", () => {
+    const expression = buildModelSelectionExpressionForTest("GPT-5.6 Sol");
+    expect(expression).toContain("getResolvedLabel()");
+    expect(expression).not.toContain("getResolvedLabel(PRIMARY_LABEL)");
   });
 
   it("waits for composer footer state when the header button stays generic", () => {
@@ -1463,10 +1518,10 @@ describe("browser model selection matchers", () => {
     expect(expression).toContain("button.__composer-pill')).find(looksLikeModelPill)");
   });
 
-  it("recognizes GPT-5.5 from the new Intelligence submenu while the button shows effort", async () => {
+  it("does not claim a model label when the new Intelligence picker exposes only effort", async () => {
     await expect(evaluateIntelligenceModelSelectionExpression("Thinking 5.5")).resolves.toEqual({
       status: "already-selected",
-      label: "Thinking 5.5",
+      label: "",
     });
   });
 
@@ -1486,12 +1541,12 @@ describe("browser model selection matchers", () => {
     });
   });
 
-  it("uses the non-Pro Intelligence effort row when switching from Pro to Thinking 5.5", async () => {
+  it("does not treat a non-Pro Intelligence effort row as a model label after switching", async () => {
     await expect(
       evaluateIntelligenceModelSelectionExpression("Thinking 5.5", "Pro Extended"),
     ).resolves.toEqual({
       status: "switched",
-      label: "Extra High",
+      label: "",
     });
   });
 
@@ -1516,6 +1571,15 @@ describe("browser model selection matchers", () => {
       status: "switched",
       label: "Thinking 5.6 Sol",
     });
+  });
+
+  it("accepts configured GPT-5.6 Sol with independent Pro effort", async () => {
+    await expect(evaluateConfiguredModelSelectionExpression("GPT-5.6 Sol", "Pro")).resolves.toEqual(
+      {
+        status: "switched",
+        label: "5.6 Sol",
+      },
+    );
   });
 
   it("selects the requested variant after changing Configure versions", async () => {

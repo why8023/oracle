@@ -60,6 +60,7 @@ describe("resumeBrowserSession", () => {
       meta: { messageId: "m1", turnId: "conversation-turn-1" },
     }));
     const captureAssistantMarkdown = vi.fn(async () => "markdown response");
+    const waitForConversationHydration = vi.fn(async () => 2);
     const logger = vi.fn() as BrowserLogger;
     logger.verbose = true;
 
@@ -68,6 +69,7 @@ describe("resumeBrowserSession", () => {
       connect,
       waitForAssistantResponse,
       captureAssistantMarkdown,
+      waitForConversationHydration,
     });
 
     expect(result.answerMarkdown).toBe("markdown response");
@@ -76,6 +78,14 @@ describe("resumeBrowserSession", () => {
     );
     expect(waitForAssistantResponse).toHaveBeenCalled();
     expect(captureAssistantMarkdown).toHaveBeenCalled();
+    expect(waitForConversationHydration).toHaveBeenCalledWith(expect.anything(), 2000, logger, {
+      requirePriorTurns: true,
+      requirePromptReady: false,
+      expectedConversationUrl: runtime.tabUrl,
+    });
+    expect(waitForConversationHydration.mock.invocationCallOrder[0]).toBeLessThan(
+      waitForAssistantResponse.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+    );
     expect(close).toHaveBeenCalledOnce();
   });
 
@@ -125,6 +135,7 @@ describe("resumeBrowserSession", () => {
       connect,
       waitForAssistantResponse,
       captureAssistantMarkdown,
+      waitForConversationHydration: vi.fn(async () => 2),
       promptPreview: "live reattach pro 123",
     });
 
@@ -189,6 +200,7 @@ describe("resumeBrowserSession", () => {
         waitForAssistantResponse,
         captureAssistantMarkdown,
         waitForDeepResearchCompletion,
+        waitForConversationHydration: vi.fn(async () => 2),
       },
     );
 
@@ -271,6 +283,7 @@ describe("resumeBrowserSession", () => {
         connect,
         waitForAssistantResponse,
         captureAssistantMarkdown,
+        waitForConversationHydration: vi.fn(async () => 2),
       },
     );
 
@@ -312,8 +325,13 @@ describe("resumeBrowserSession", () => {
           close,
         }) satisfies FakeClient,
     ) as unknown as (options?: unknown) => Promise<ChromeClient>;
-    const waitForAssistantResponse = vi.fn(async () => {
-      throw new Error("response timeout");
+    const waitForAssistantResponse = vi.fn(async () => ({
+      text: "must not be captured from an unhydrated shell",
+      html: "",
+      meta: { messageId: "m1", turnId: "conversation-turn-1" },
+    }));
+    const waitForConversationHydration = vi.fn(async () => {
+      throw new Error("saved conversation did not hydrate");
     });
     const recoverSession = vi.fn(async () => ({
       answerText: "fallback",
@@ -325,11 +343,13 @@ describe("resumeBrowserSession", () => {
       listTargets,
       connect,
       waitForAssistantResponse,
+      waitForConversationHydration,
       recoverSession,
     });
 
     expect(result.answerText).toBe("fallback");
     expect(close).toHaveBeenCalledOnce();
+    expect(waitForAssistantResponse).not.toHaveBeenCalled();
     expect(recoverSession).toHaveBeenCalled();
   });
 });

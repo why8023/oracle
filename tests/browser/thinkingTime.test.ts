@@ -20,7 +20,7 @@ describe("browser thinking-time selection expression", () => {
   });
 
   it("targets the requested thinking time level", () => {
-    const levels = ["light", "standard", "extended", "heavy"] as const;
+    const levels = ["light", "standard", "extended", "extra-high", "heavy"] as const;
     for (const level of levels) {
       const expression = buildThinkingTimeExpressionForTest(level);
       expect(expression).toContain("const TARGET_LEVEL");
@@ -46,7 +46,13 @@ describe("browser thinking-time selection expression", () => {
     expect(buildThinkingTimeExpressionForTest("extended")).toContain(
       "extended: ['extended', 'high'",
     );
-    expect(buildThinkingTimeExpressionForTest("heavy")).toContain("heavy: ['heavy', 'extra high'");
+    expect(buildThinkingTimeExpressionForTest("extra-high")).toContain(
+      "'extra-high': ['extra high'",
+    );
+    expect(buildThinkingTimeExpressionForTest("heavy")).toContain("heavy: ['heavy'");
+    expect(buildThinkingTimeExpressionForTest("heavy")).not.toContain(
+      "heavy: ['heavy', 'extra high'",
+    );
   });
 
   it("accepts standard selected-state markers when verifying effort", () => {
@@ -66,9 +72,9 @@ describe("browser thinking-time selection expression", () => {
   });
 
   it("preserves Chinese thinking-effort labels while normalizing", () => {
-    const expression = buildThinkingTimeExpressionForTest("heavy");
+    const expression = buildThinkingTimeExpressionForTest("extra-high");
     expect(expression).toContain("\\u4e00-\\u9fa5");
-    expect(expression).toContain("'重度'");
+    expect(expression).toContain("'极高'");
   });
 
   it("infers target model kind with token matching", () => {
@@ -350,6 +356,7 @@ describe("browser thinking-time selection expression", () => {
         private readonly attributes: Readonly<Record<string, string>> = {},
         private readonly children: FakeElement[] = [],
         private readonly nestedIntelligence: FakeElement | null = null,
+        private readonly onDispatch?: () => void,
       ) {
         super();
       }
@@ -375,6 +382,10 @@ describe("browser thinking-time selection expression", () => {
         );
       }
       focus(): void {}
+      override dispatchEvent(event: unknown): boolean {
+        this.onDispatch?.();
+        return super.dispatchEvent(event);
+      }
       getBoundingClientRect(): { width: number; height: number } {
         return { width: 144, height: 36 };
       }
@@ -473,6 +484,350 @@ describe("browser thinking-time selection expression", () => {
         FakeElement,
       ),
     ).resolves.toEqual({ status: "already-selected", label: "Pro" });
+
+    const solHeavyExpression = buildThinkingTimeExpressionForTest("heavy", "gpt-5.6-sol");
+    const currentMenuItems = [
+      new FakeElement("ModelGPT-5.6 Sol", { role: "menuitem", "aria-haspopup": "menu" }),
+      new FakeElement("EffortPro", { role: "menuitem", "aria-haspopup": "menu" }),
+    ];
+    const currentIntelligenceGroup = new FakeElement(
+      "ModelGPT-5.6 SolEffortPro",
+      { "data-testid": "composer-intelligence-picker-content", role: "group" },
+      currentMenuItems,
+    );
+    const currentOuterMenu = new FakeElement(
+      currentIntelligenceGroup.textContent,
+      { role: "menu" },
+      currentMenuItems,
+      currentIntelligenceGroup,
+    );
+    const proOnlyDocumentStub = {
+      ...documentStub,
+      querySelector: (selector: string) => {
+        if (selector.includes("composer-intelligence-pro-thinking-effort-trigger")) return null;
+        if (selector.includes("composer-intelligence-picker-content")) {
+          return currentIntelligenceGroup;
+        }
+        if (
+          selector.includes("model-switcher-dropdown-button") ||
+          selector.includes("__composer-pill")
+        ) {
+          return modelButton;
+        }
+        return null;
+      },
+      querySelectorAll: (selector: string) => {
+        if (selector.includes("__composer-pill")) return [modelButton];
+        if (selector.includes('role="menu"') || selector.includes("data-radix")) {
+          return [currentOuterMenu];
+        }
+        return [];
+      },
+    };
+    const evaluateSolHeavy = new Function(
+      "document",
+      "performance",
+      "setTimeout",
+      "window",
+      "EventTarget",
+      "PointerEvent",
+      "MouseEvent",
+      "HTMLElement",
+      `return ${solHeavyExpression};`,
+    ) as typeof evaluate;
+
+    await expect(
+      evaluateSolHeavy(
+        proOnlyDocumentStub,
+        performanceStub,
+        (callback: () => void) => callback(),
+        { PointerEvent: FakeMouseEvent, MouseEvent: FakeMouseEvent, Event: FakeMouseEvent },
+        FakeEventTarget,
+        FakeMouseEvent,
+        FakeMouseEvent,
+        FakeElement,
+      ),
+    ).resolves.toEqual({ status: "already-selected", label: "Pro" });
+
+    const proAttributes: Record<string, string> = {
+      role: "menuitemradio",
+      "aria-checked": "false",
+      "data-state": "unchecked",
+    };
+    const selectablePro = new FakeElement("Pro", proAttributes, [], null, () => {
+      proAttributes["aria-checked"] = "true";
+      proAttributes["data-state"] = "checked";
+    });
+    const selectableItems = [
+      selectablePro,
+      new FakeElement("GPT-5.6 Sol", { role: "menuitem", "aria-haspopup": "menu" }),
+    ];
+    const selectableGroup = new FakeElement(
+      "Pro GPT-5.6 Sol",
+      { "data-testid": "composer-intelligence-picker-content", role: "group" },
+      selectableItems,
+    );
+    const selectableMenu = new FakeElement(
+      selectableGroup.textContent,
+      { role: "menu" },
+      selectableItems,
+      selectableGroup,
+    );
+    const solModelButton = new FakeElement("Extra High", {
+      class: "__composer-pill",
+      "aria-expanded": "true",
+      "aria-haspopup": "menu",
+    });
+    const selectableDocumentStub = {
+      ...documentStub,
+      querySelector: (selector: string) => {
+        if (selector.includes("composer-intelligence-pro-thinking-effort-trigger")) return null;
+        if (selector.includes("composer-intelligence-picker-content")) return selectableGroup;
+        if (
+          selector.includes("model-switcher-dropdown-button") ||
+          selector.includes("__composer-pill")
+        ) {
+          return solModelButton;
+        }
+        return null;
+      },
+      querySelectorAll: (selector: string) => {
+        if (selector.includes("__composer-pill")) return [solModelButton];
+        if (selector.includes('role="menu"') || selector.includes("data-radix")) {
+          return [selectableMenu];
+        }
+        return [];
+      },
+    };
+
+    await expect(
+      evaluateSolHeavy(
+        selectableDocumentStub,
+        performanceStub,
+        (callback: () => void) => callback(),
+        { PointerEvent: FakeMouseEvent, MouseEvent: FakeMouseEvent, Event: FakeMouseEvent },
+        FakeEventTarget,
+        FakeMouseEvent,
+        FakeMouseEvent,
+        FakeElement,
+      ),
+    ).resolves.toEqual({ status: "switched", label: "Pro" });
+
+    const competingProAttributes: Record<string, string> = {
+      role: "menuitemradio",
+      "aria-checked": "false",
+      "data-state": "unchecked",
+    };
+    const competingPro = new FakeElement("Pro", competingProAttributes, [], null, () => {
+      competingProAttributes["aria-checked"] = "true";
+      competingProAttributes["data-state"] = "checked";
+    });
+    const competingItems = [
+      new FakeElement("Extra High", {
+        role: "menuitemradio",
+        "aria-checked": "false",
+        "data-state": "unchecked",
+      }),
+      competingPro,
+      new FakeElement("GPT-5.6 Sol", { role: "menuitem", "aria-haspopup": "menu" }),
+    ];
+    const competingGroup = new FakeElement(
+      "Extra High Pro GPT-5.6 Sol",
+      { "data-testid": "composer-intelligence-picker-content", role: "group" },
+      competingItems,
+    );
+    const competingMenu = new FakeElement(
+      competingGroup.textContent,
+      { role: "menu" },
+      competingItems,
+      competingGroup,
+    );
+    const competingDocumentStub = {
+      ...selectableDocumentStub,
+      querySelector: (selector: string) => {
+        if (selector.includes("composer-intelligence-pro-thinking-effort-trigger")) return null;
+        if (selector.includes("composer-intelligence-picker-content")) return competingGroup;
+        if (
+          selector.includes("model-switcher-dropdown-button") ||
+          selector.includes("__composer-pill")
+        ) {
+          return solModelButton;
+        }
+        return null;
+      },
+      querySelectorAll: (selector: string) => {
+        if (selector.includes("__composer-pill")) return [solModelButton];
+        if (selector.includes('role="menu"') || selector.includes("data-radix")) {
+          return [competingMenu];
+        }
+        return [];
+      },
+    };
+
+    await expect(
+      evaluateSolHeavy(
+        competingDocumentStub,
+        performanceStub,
+        (callback: () => void) => callback(),
+        { PointerEvent: FakeMouseEvent, MouseEvent: FakeMouseEvent, Event: FakeMouseEvent },
+        FakeEventTarget,
+        FakeMouseEvent,
+        FakeMouseEvent,
+        FakeElement,
+      ),
+    ).resolves.toEqual({ status: "switched", label: "Pro" });
+
+    const extraHighAttributes: Record<string, string> = {
+      role: "menuitemradio",
+      "aria-checked": "false",
+      "data-state": "unchecked",
+    };
+    const selectableExtraHigh = new FakeElement(
+      "Extra High",
+      extraHighAttributes,
+      [],
+      null,
+      () => {
+        extraHighAttributes["aria-checked"] = "true";
+        extraHighAttributes["data-state"] = "checked";
+      },
+    );
+    const extraHighItems = [
+      selectableExtraHigh,
+      new FakeElement("Pro", {
+        role: "menuitemradio",
+        "aria-checked": "false",
+        "data-state": "unchecked",
+      }),
+      new FakeElement("GPT-5.6 Sol", { role: "menuitem", "aria-haspopup": "menu" }),
+    ];
+    const extraHighGroup = new FakeElement(
+      "Extra High Pro GPT-5.6 Sol",
+      { "data-testid": "composer-intelligence-picker-content", role: "group" },
+      extraHighItems,
+    );
+    const extraHighMenu = new FakeElement(
+      extraHighGroup.textContent,
+      { role: "menu" },
+      extraHighItems,
+      extraHighGroup,
+    );
+    const mediumPill = new FakeElement("High", {
+      class: "__composer-pill",
+      "aria-expanded": "true",
+      "aria-haspopup": "menu",
+    });
+    const extraHighDocumentStub = {
+      ...documentStub,
+      querySelector: (selector: string) => {
+        if (selector.includes("composer-intelligence-pro-thinking-effort-trigger")) return null;
+        if (selector.includes("composer-intelligence-picker-content")) return extraHighGroup;
+        if (
+          selector.includes("model-switcher-dropdown-button") ||
+          selector.includes("__composer-pill")
+        ) {
+          return mediumPill;
+        }
+        return null;
+      },
+      querySelectorAll: (selector: string) => {
+        if (selector.includes("__composer-pill")) return [mediumPill];
+        if (selector.includes('role="menu"') || selector.includes("data-radix")) {
+          return [extraHighMenu];
+        }
+        return [];
+      },
+    };
+    const evaluateSolExtraHigh = new Function(
+      "document",
+      "performance",
+      "setTimeout",
+      "window",
+      "EventTarget",
+      "PointerEvent",
+      "MouseEvent",
+      "HTMLElement",
+      `return ${buildThinkingTimeExpressionForTest("extra-high", "gpt-5.6-sol")};`,
+    ) as typeof evaluate;
+
+    await expect(
+      evaluateSolExtraHigh(
+        extraHighDocumentStub,
+        performanceStub,
+        (callback: () => void) => callback(),
+        { PointerEvent: FakeMouseEvent, MouseEvent: FakeMouseEvent, Event: FakeMouseEvent },
+        FakeEventTarget,
+        FakeMouseEvent,
+        FakeMouseEvent,
+        FakeElement,
+      ),
+    ).resolves.toEqual({ status: "switched", label: "Extra High" });
+
+    const alreadyExtraHighPill = new FakeElement("Extra High", {
+      class: "__composer-pill",
+      "aria-expanded": "false",
+      "aria-haspopup": "menu",
+    });
+    const alreadyExtraHighItems = [
+      new FakeElement("Extra High", {
+        role: "menuitemradio",
+        "aria-checked": "true",
+        "data-state": "checked",
+      }),
+      new FakeElement("Pro", {
+        role: "menuitemradio",
+        "aria-checked": "false",
+        "data-state": "unchecked",
+      }),
+      new FakeElement("GPT-5.6 Sol", { role: "menuitem", "aria-haspopup": "menu" }),
+    ];
+    const alreadyExtraHighGroup = new FakeElement(
+      "Extra High Pro GPT-5.6 Sol",
+      { "data-testid": "composer-intelligence-picker-content", role: "group" },
+      alreadyExtraHighItems,
+    );
+    const alreadyExtraHighMenu = new FakeElement(
+      alreadyExtraHighGroup.textContent,
+      { role: "menu" },
+      alreadyExtraHighItems,
+      alreadyExtraHighGroup,
+    );
+    const alreadyExtraHighDocumentStub = {
+      ...documentStub,
+      querySelector: (selector: string) => {
+        if (selector.includes("composer-intelligence-pro-thinking-effort-trigger")) return null;
+        if (selector.includes("composer-intelligence-picker-content")) {
+          return alreadyExtraHighGroup;
+        }
+        if (
+          selector.includes("model-switcher-dropdown-button") ||
+          selector.includes("__composer-pill")
+        ) {
+          return alreadyExtraHighPill;
+        }
+        return null;
+      },
+      querySelectorAll: (selector: string) => {
+        if (selector.includes("__composer-pill")) return [alreadyExtraHighPill];
+        if (selector.includes('role="menu"') || selector.includes("data-radix")) {
+          return [alreadyExtraHighMenu];
+        }
+        return [];
+      },
+    };
+
+    await expect(
+      evaluateSolExtraHigh(
+        alreadyExtraHighDocumentStub,
+        performanceStub,
+        (callback: () => void) => callback(),
+        { PointerEvent: FakeMouseEvent, MouseEvent: FakeMouseEvent, Event: FakeMouseEvent },
+        FakeEventTarget,
+        FakeMouseEvent,
+        FakeMouseEvent,
+        FakeElement,
+      ),
+    ).resolves.toEqual({ status: "already-selected", label: "Extra High" });
   });
 
   it("selects exact Chinese Intelligence tiers without prefix collisions", async () => {
@@ -532,7 +887,7 @@ describe("browser thinking-time selection expression", () => {
     }
 
     const cases: Array<{
-      level: "light" | "standard" | "extended" | "heavy";
+      level: "light" | "standard" | "extended" | "extra-high" | "heavy";
       label: string;
       reverseAmbiguousPair?: boolean;
       omitExtraHigh?: boolean;
@@ -540,9 +895,9 @@ describe("browser thinking-time selection expression", () => {
       { level: "light", label: "极速5.5" },
       { level: "standard", label: "中" },
       { level: "extended", label: "高", reverseAmbiguousPair: true },
-      { level: "heavy", label: "极高" },
-      { level: "heavy", label: "极高", reverseAmbiguousPair: true },
-      { level: "heavy", label: "高", omitExtraHigh: true },
+      { level: "extra-high", label: "极高" },
+      { level: "extra-high", label: "极高", reverseAmbiguousPair: true },
+      { level: "extra-high", label: "高", omitExtraHigh: true },
     ];
 
     for (const testCase of cases) {
@@ -579,13 +934,14 @@ describe("browser thinking-time selection expression", () => {
           ? [extraHigh, high]
           : [high, extraHigh];
       const orderedEfforts = [instant, medium, ...ambiguousPair];
+      const proEfforts = testCase.level === "heavy" ? [] : [proRadio];
       const effortItems = [
         ...orderedEfforts,
-        proRadio,
+        ...proEfforts,
         new FakeElement("GPT-5.6 Sol", { role: "menuitem", "aria-haspopup": "menu" }),
       ];
       const intelligenceGroup = new FakeElement(
-        `智能 ${orderedEfforts.map((item) => item.textContent).join(" ")} Pro 深度模式 GPT-5.6 Sol`,
+        `智能 ${orderedEfforts.map((item) => item.textContent).join(" ")} ${proEfforts.map((item) => item.textContent).join(" ")} GPT-5.6 Sol`,
         { "data-testid": "composer-intelligence-picker-content", role: "group" },
         effortItems,
       );
@@ -1105,7 +1461,7 @@ describe("browser thinking-time selection expression", () => {
       extraHigh.setAttribute("data-state", "unchecked");
       let now = 0;
       let timers = 0;
-      const expression = buildThinkingTimeExpressionForTest("heavy", targetModel);
+      const expression = buildThinkingTimeExpressionForTest("extra-high", targetModel);
       const evaluate = new Function(
         "document",
         "performance",
@@ -1863,7 +2219,7 @@ describe("browser thinking-time selection expression", () => {
     };
     let now = 0;
     const performanceStub = { now: () => (now += 100) };
-    const expression = buildThinkingTimeExpressionForTest("heavy", "Thinking 5.5");
+    const expression = buildThinkingTimeExpressionForTest("extra-high", "Thinking 5.5");
     const evaluate = new Function(
       "document",
       "performance",

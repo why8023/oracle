@@ -140,6 +140,20 @@ export async function performSessionRun({
         },
         runnerDeps,
       );
+      await writeAssistantOutput(runOptions.writeOutputPath, result.answerText ?? "", log);
+      await sendSessionNotification(
+        {
+          sessionId: sessionMeta.id,
+          sessionName: sessionMeta.options?.slug ?? sessionMeta.id,
+          mode,
+          model: sessionMeta.model,
+          usage: result.usage,
+          characters: result.answerText?.length,
+        },
+        notificationSettings,
+        log,
+        result.answerText?.slice(0, 140),
+      );
       if (modelForStatus) {
         await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
           status: "completed",
@@ -165,20 +179,6 @@ export async function performSessionRun({
         transport: undefined,
         error: undefined,
       });
-      await writeAssistantOutput(runOptions.writeOutputPath, result.answerText ?? "", log);
-      await sendSessionNotification(
-        {
-          sessionId: sessionMeta.id,
-          sessionName: sessionMeta.options?.slug ?? sessionMeta.id,
-          mode,
-          model: sessionMeta.model,
-          usage: result.usage,
-          characters: result.answerText?.length,
-        },
-        notificationSettings,
-        log,
-        result.answerText?.slice(0, 140),
-      );
       return;
     }
     const multiModels = Array.isArray(runOptions.models) ? runOptions.models.filter(Boolean) : [];
@@ -476,16 +476,6 @@ export async function performSessionRun({
     if (result.mode !== "live") {
       throw new Error("Unexpected preview result while running a session.");
     }
-    await sessionStore.updateSession(sessionMeta.id, {
-      status: "completed",
-      completedAt: new Date().toISOString(),
-      usage: result.usage,
-      elapsedMs: result.elapsedMs,
-      errorMessage: undefined,
-      response: extractResponseMetadata(result.response),
-      transport: undefined,
-      error: undefined,
-    });
     if (modelForStatus && singleModelOverride == null) {
       await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
         status: "completed",
@@ -508,6 +498,16 @@ export async function performSessionRun({
       log,
       answerText.slice(0, 140),
     );
+    await sessionStore.updateSession(sessionMeta.id, {
+      status: "completed",
+      completedAt: new Date().toISOString(),
+      usage: result.usage,
+      elapsedMs: result.elapsedMs,
+      errorMessage: undefined,
+      response: extractResponseMetadata(result.response),
+      transport: undefined,
+      error: undefined,
+    });
   } catch (error: unknown) {
     const message = formatError(error);
     log(`ERROR: ${message}`);
@@ -641,16 +641,60 @@ export async function performSessionRun({
       const runtime = (userError.details as { runtime?: BrowserRuntimeMetadata } | undefined)
         ?.runtime;
       log(dim("Assistant response timed out; marking capture incomplete for reattach."));
+      const timeoutResponse = {
+        status: "incomplete",
+        incompleteReason: "incomplete-capture",
+      } as const;
+      const timeoutError = {
+        category: userError.category,
+        message: userError.message,
+        details: userError.details,
+      };
+      const autoReattachIntervalMs = browserConfig?.autoReattachIntervalMs ?? 0;
+      const autoRuntime = runtime ?? currentBrowser?.runtime;
+      const willAutoReattach = autoReattachIntervalMs > 0 && Boolean(autoRuntime);
+      if (willAutoReattach) {
+        if (modelForStatus) {
+          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+            status: "running",
+            completedAt: undefined,
+            response: timeoutResponse,
+            error: timeoutError,
+          });
+        }
+        await sessionStore.updateSession(sessionMeta.id, {
+          status: "running",
+          completedAt: undefined,
+          errorMessage: message,
+          mode,
+          browser: {
+            ...currentBrowser,
+            config: browserConfig,
+            runtime: autoRuntime,
+          },
+          response: timeoutResponse,
+          error: timeoutError,
+        });
+        const success = await autoReattachUntilComplete({
+          sessionMeta,
+          runtime: autoRuntime,
+          browserConfig,
+          browserMetadata: currentBrowser,
+          runOptions,
+          modelForStatus,
+          notificationSettings,
+          log,
+        });
+        if (success) {
+          return;
+        }
+      }
       if (modelForStatus) {
         await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
           status: "error",
           completedAt: new Date().toISOString(),
-          response: { status: "incomplete", incompleteReason: "incomplete-capture" },
-          error: {
-            category: userError.category,
-            message: userError.message,
-            details: userError.details,
-          },
+          response: timeoutResponse,
+          error: timeoutError,
         });
       }
       await sessionStore.updateSession(sessionMeta.id, {
@@ -663,30 +707,9 @@ export async function performSessionRun({
           config: browserConfig,
           runtime: runtime ?? currentBrowser?.runtime,
         },
-        response: { status: "incomplete", incompleteReason: "incomplete-capture" },
-        error: {
-          category: userError.category,
-          message: userError.message,
-          details: userError.details,
-        },
+        response: timeoutResponse,
+        error: timeoutError,
       });
-      const autoReattachIntervalMs = browserConfig?.autoReattachIntervalMs ?? 0;
-      if (autoReattachIntervalMs > 0) {
-        const autoRuntime = runtime ?? currentBrowser?.runtime;
-        const success = await autoReattachUntilComplete({
-          sessionMeta,
-          runtime: autoRuntime ?? undefined,
-          browserConfig,
-          browserMetadata: currentBrowser,
-          runOptions,
-          modelForStatus,
-          notificationSettings,
-          log,
-        });
-        if (success) {
-          return;
-        }
-      }
       logBrowserReattachGuidance(runtime ?? currentBrowser?.runtime);
       return;
     }
@@ -1186,6 +1209,7 @@ async function autoReattachUntilComplete({
     }
     attempt += 1;
     log(dim(`Auto-reattach attempt ${attempt}...`));
+    let captureSucceeded = false;
     try {
       const reattachConfig: BrowserSessionConfig = {
         ...browserConfig,
@@ -1194,6 +1218,7 @@ async function autoReattachUntilComplete({
       const result = await resumeBrowserSession(runtime, reattachConfig, logger, {
         promptPreview: sessionMeta.promptPreview,
       });
+      captureSucceeded = true;
       const answerText = result.answerMarkdown || result.answerText || "";
       const outputTokens = estimateTokenCount(answerText);
       const artifacts = await ensureSessionArtifacts({
@@ -1222,6 +1247,23 @@ async function autoReattachUntilComplete({
           },
         });
       }
+      await writeAssistantOutput(runOptions.writeOutputPath, answerText, log);
+      await sendSessionNotification(
+        {
+          sessionId: sessionMeta.id,
+          sessionName: sessionMeta.options?.slug ?? sessionMeta.id,
+          mode: sessionMeta.mode ?? "browser",
+          model: sessionMeta.model ?? runOptions.model,
+          usage: {
+            inputTokens: 0,
+            outputTokens,
+          },
+          characters: answerText.length,
+        },
+        notificationSettings,
+        log,
+        answerText.slice(0, 140),
+      );
       await sessionStore.updateSession(sessionMeta.id, {
         status: "completed",
         completedAt: new Date().toISOString(),
@@ -1242,26 +1284,34 @@ async function autoReattachUntilComplete({
         error: undefined,
         transport: undefined,
       });
-      await writeAssistantOutput(runOptions.writeOutputPath, answerText, log);
-      await sendSessionNotification(
-        {
-          sessionId: sessionMeta.id,
-          sessionName: sessionMeta.options?.slug ?? sessionMeta.id,
-          mode: sessionMeta.mode ?? "browser",
-          model: sessionMeta.model ?? runOptions.model,
-          usage: {
-            inputTokens: 0,
-            outputTokens,
-          },
-          characters: answerText.length,
-        },
-        notificationSettings,
-        log,
-        answerText.slice(0, 140),
-      );
       log(kleur.green("Auto-reattach succeeded; session marked completed."));
       return true;
     } catch (error) {
+      if (captureSucceeded) {
+        const message = formatError(error);
+        if (modelForStatus) {
+          await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
+            status: "error",
+            completedAt: new Date().toISOString(),
+          });
+        }
+        await sessionStore.updateSession(sessionMeta.id, {
+          status: "error",
+          completedAt: new Date().toISOString(),
+          errorMessage: message,
+          browser: {
+            ...browserMetadata,
+            config: browserConfig,
+            runtime,
+          },
+          response: { status: "error", incompleteReason: "incomplete-capture" },
+          error: {
+            category: "internal",
+            message,
+          },
+        });
+        throw error;
+      }
       const message = error instanceof Error ? error.message : String(error);
       log(dim(`Auto-reattach attempt ${attempt} failed: ${message}`));
     }

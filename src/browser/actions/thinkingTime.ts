@@ -116,7 +116,7 @@ export async function ensureThinkingTime(
 /**
  * Best-effort selection of a thinking time level in ChatGPT's composer pill menu.
  * Safe by default: if the pill/menu/option isn't present, we continue without throwing.
- * @param level - The thinking time intensity: 'light', 'standard', 'extended', or 'heavy'
+ * @param level - The thinking time intensity: 'light', 'standard', 'extended', 'extra-high', or 'heavy'
  */
 export async function ensureThinkingTimeIfAvailable(
   Runtime: ChromeClient["Runtime"],
@@ -206,7 +206,8 @@ function buildThinkingTimeExpression(
       light: ['light', 'instant', '轻', '极速'],
       standard: ['standard', 'medium', '标准', '中'],
       extended: ['extended', 'high', '扩展', '深度', '加强', '高'],
-      heavy: ['heavy', 'extra high', '重度', '加重', '极高'],
+      'extra-high': ['extra high', '极高'],
+      heavy: ['heavy', '重度', '加重'],
     };
     const targetTokens = LEVEL_TOKENS[TARGET_LEVEL] || [TARGET_LEVEL];
 
@@ -456,6 +457,24 @@ function buildThinkingTimeExpression(
           return null;
         }
       }
+      if (
+        TARGET_IS_GPT56_MODEL &&
+        TARGET_LEVEL === 'heavy' &&
+        isIntelligenceEffortMenu(menu)
+      ) {
+        for (const item of items) {
+          const itemText = normalize(
+            (item.textContent ?? '') + ' ' + (item.getAttribute?.('aria-label') ?? ''),
+          );
+          if (
+            hasToken(itemText, 'pro') &&
+            !itemText.includes('gpt') &&
+            !/(?:^|\\s)5[ .-]?6(?:\\s|$)/.test(itemText)
+          ) {
+            return item;
+          }
+        }
+      }
       for (const item of items) {
         const itemText = normalize(
           (item.textContent ?? '') + ' ' + (item.getAttribute?.('aria-label') ?? ''),
@@ -470,10 +489,10 @@ function buildThinkingTimeExpression(
           return item;
         }
       }
-      if (TARGET_LEVEL === 'heavy') {
-        // Older Chinese layouts used bare 高 for the highest effort. Keep it
-        // only as a second-pass exact fallback so a current 高 row can never
-        // win before the primary 极高 row.
+      if (TARGET_LEVEL === 'extra-high') {
+        // Older Chinese layouts used bare 高 for the highest non-Pro effort.
+        // Keep it only as a second-pass exact fallback so a current 高 row can
+        // never win before the primary 极高 row.
         for (const item of items) {
           const itemText = normalize(item.textContent ?? '');
           const ariaLabel = normalize(item.getAttribute?.('aria-label') ?? '');
@@ -579,19 +598,37 @@ function buildThinkingTimeExpression(
     const currentEffortPillMatchesTarget = (trigger, modelKindOverride = null) => {
       if (currentProEffortPillMatchesTarget(trigger, modelKindOverride)) return true;
       const button = freshComposerTrigger(trigger) || findModelButton();
+      const normalizedLabel = normalize(
+        (button?.textContent ?? '') + ' ' + (button?.getAttribute?.('aria-label') ?? ''),
+      );
+      if (
+        TARGET_IS_GPT56_MODEL &&
+        TARGET_LEVEL === 'heavy' &&
+        hasToken(normalizedLabel, 'pro')
+      ) {
+        return true;
+      }
       if ((modelKindOverride || TARGET_MODEL_KIND || modelKindFromNode(button)) === 'pro') {
         return false;
       }
-      const label = (button?.textContent ?? '') + ' ' + (button?.getAttribute?.('aria-label') ?? '');
-      return matchesLevel(label);
+      return matchesLevel(normalizedLabel);
     };
     const selectAndVerify = async (trigger, findOption, modelKindOverride = null) => {
-      const option = findOption();
       const triggerModelKind =
         modelKindOverride ||
         TARGET_MODEL_KIND ||
         modelKindFromNode(trigger) ||
         effectiveTargetModelKind();
+      const option = findOption();
+      if (
+        !option &&
+        TARGET_IS_GPT56_MODEL &&
+        TARGET_LEVEL === 'heavy' &&
+        currentEffortPillMatchesTarget(trigger, triggerModelKind)
+      ) {
+        closeOpenMenus();
+        return { status: 'already-selected', label: trigger.textContent?.trim?.() || null };
+      }
       if (!option) return failure('option-not-found', { modelKind: triggerModelKind });
       const label = option.textContent?.trim?.() || null;
       if (optionIsSelected(option)) {

@@ -67,17 +67,18 @@ export async function ensureModelSelection(
     case "already-selected":
     case "switched": {
       const observedLabel = result.label?.trim() || null;
-      const label = observedLabel || (strategy === "current" ? null : desiredModel);
-      if (strategy !== "current") {
-        assertResolvedModelSelection(desiredModel, observedLabel ?? "");
+      if (strategy !== "current" && observedLabel !== null) {
+        assertResolvedModelSelection(desiredModel, observedLabel);
       }
-      logger(`Model picker: ${label ?? "current model (label unavailable)"}`);
+      logger(`Model picker: ${observedLabel ?? "current model (label unavailable)"}`);
       return {
         requestedModel: desiredModel,
-        resolvedLabel: label,
+        // A picker target is intent, not observed UI evidence. Keep it separate from the
+        // resolved label so display code cannot turn a fallback into a claimed selection.
+        resolvedLabel: observedLabel,
         strategy,
         status: result.status,
-        verified: strategy !== "current",
+        verified: strategy !== "current" && observedLabel !== null,
         source: "chatgpt-model-picker",
         capturedAt: new Date().toISOString(),
       };
@@ -354,12 +355,10 @@ function buildModelSelectionExpression(
     const getComposerModelLabel = () =>
       (document.querySelector(COMPOSER_MODEL_SIGNAL_SELECTOR)?.textContent ?? '').trim();
     const readComposerModelSignal = () => normalizeText(getComposerModelLabel());
-    const isIntelligenceEffortLabel = (label) =>
-      label === 'instant' ||
+    const isEffortOnlyLabel = (label) =>
       label === 'medium' ||
       label === 'high' ||
       label === 'extra high' ||
-      label === 'pro' ||
       label === 'extended' ||
       label === 'standard' ||
       label === 'heavy' ||
@@ -440,7 +439,6 @@ function buildModelSelectionExpression(
         !configuredVersionLabel.includes(desiredModelVariant) &&
         !configuredVariant.includes(desiredModelVariant)
       ) return false;
-      if (desiredModelVariant === 'sol' && labelHasProWord(configuredVariant)) return false;
       if (wantsPro) return labelHasProWord(configuredVariant);
       if (wantsInstant) return configuredVariant.includes('instant');
       if (wantsThinking) {
@@ -448,10 +446,11 @@ function buildModelSelectionExpression(
       }
       return true;
     };
-    const getResolvedLabel = (fallback) => {
+    const getResolvedLabel = (observedOptionLabel = '') => {
       if (configuredSelectionMatchesTarget()) {
         const variant = getConfiguredVariantLabel();
         const version = formatModelOptionLabel(getConfiguredVersionLabel());
+        if (desiredModelVariant === 'sol' && labelHasProWord(normalizeText(variant))) return version;
         return [variant, version].filter(Boolean).join(' ');
       }
       const composerLabel = getComposerModelLabel();
@@ -462,6 +461,7 @@ function buildModelSelectionExpression(
         versionFromLabel(normalizedComposerLabel) === desiredVersion &&
         normalizedComposerLabel.split(' ').includes(desiredModelVariant)
       ) {
+        if (desiredModelVariant === 'sol' && hasProComposerPill()) return PRIMARY_LABEL;
         return withProPillSignal(composerLabel);
       }
       const buttonLabel = getButtonLabel();
@@ -472,23 +472,21 @@ function buildModelSelectionExpression(
         versionFromLabel(normalizedButton) === desiredVersion &&
         normalizedButton.split(' ').includes(desiredModelVariant)
       ) {
+        if (desiredModelVariant === 'sol' && hasProComposerPill()) return PRIMARY_LABEL;
         return withProPillSignal(buttonLabel);
       }
-      const fallbackLabel = formatModelOptionLabel(fallback);
-      const normalizedFallback = normalizeText(fallbackLabel);
-      if (
-        desiredVersion &&
-        desiredModelVariant &&
-        versionFromLabel(normalizedFallback) === desiredVersion &&
-        normalizedFallback.split(' ').includes(desiredModelVariant)
-      ) {
-        return fallbackLabel;
-      }
-      if (composerLabel) return withProPillSignal(composerLabel);
-      if (fallbackLabel && !wantsPro && isIntelligenceEffortLabel(normalizedButton)) {
-        return fallbackLabel;
-      }
-      return withProPillSignal(buttonLabel || fallbackLabel || fallback);
+      const observedLabel = (label) => {
+        const formatted = formatModelOptionLabel(label);
+        return formatted && !isEffortOnlyLabel(normalizeText(formatted))
+          ? withProPillSignal(formatted)
+          : '';
+      };
+      return (
+        observedLabel(observedOptionLabel) ||
+        observedLabel(composerLabel) ||
+        observedLabel(buttonLabel) ||
+        (wantsPro && hasProComposerPill() ? 'Pro' : '')
+      );
     };
     if (MODEL_STRATEGY === 'current') {
       const currentLabel = getResolvedLabel('') || null;
@@ -506,7 +504,6 @@ function buildModelSelectionExpression(
       if (configuredSelectionMatchesTarget()) return true;
       const normalizedLabel = normalizeText(getButtonLabel());
       if (!normalizedLabel) return false;
-      if (desiredModelVariant === 'sol' && hasProComposerPill()) return false;
       if (wantsThinking && !wantsPro && hasProComposerPill()) return false;
       if (isTargetGpt55VisibleAlias(normalizedLabel)) return true;
       if (
@@ -553,7 +550,11 @@ function buildModelSelectionExpression(
       }
       if (wantsThinking && !normalizedLabel.includes('thinking')) return false;
       // Also reject if button has variants we DON'T want
-      if (!wantsPro && normalizedLabel.includes(' pro')) return false;
+      if (
+        !wantsPro &&
+        normalizedLabel.includes(' pro') &&
+        !(desiredModelVariant === 'sol' && hasProComposerPill())
+      ) return false;
       if (!wantsInstant && normalizedLabel.includes('instant')) return false;
       if (!wantsThinking && normalizedLabel.includes('thinking')) return false;
       return true;
@@ -567,13 +568,14 @@ function buildModelSelectionExpression(
       if (!signal) {
         return COMPOSER_SIGNAL_ALLOW_BLANK;
       }
-      if (desiredModelVariant === 'sol' && hasProComposerPill()) {
-        return false;
-      }
       if (wantsPro && labelHasLegacyProVersion(signal)) {
         return false;
       }
-      if (COMPOSER_SIGNAL_EXCLUDES.some((token) => token && signal.includes(token))) {
+      if (COMPOSER_SIGNAL_EXCLUDES.some((token) =>
+        token &&
+        signal.includes(token) &&
+        !(token === 'pro' && desiredModelVariant === 'sol' && hasProComposerPill())
+      )) {
         return false;
       }
       if (COMPOSER_SIGNAL_INCLUDES.length === 0) {
@@ -604,7 +606,7 @@ function buildModelSelectionExpression(
     };
 
     if (activeSelectionMatchesTarget()) {
-      return { status: 'already-selected', label: getResolvedLabel(PRIMARY_LABEL) };
+      return { status: 'already-selected', label: getResolvedLabel() };
     }
 
     let lastPointerClick = 0;
@@ -997,7 +999,7 @@ function buildModelSelectionExpression(
         desiredModelVariant === 'sol' &&
         (labelHasProWord(normalizedText) || normalizeText(testid ?? '').includes('pro'))
       ) return false;
-      if (desiredVersion === '5-6') return !hasProComposerPill();
+      if (desiredVersion === '5-6') return true;
       const currentButtonLabel = normalizeText(getButtonLabel());
       return !labelHasProWord(currentButtonLabel) && !hasProComposerPill();
     };

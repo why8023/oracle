@@ -173,6 +173,10 @@ function shouldPreserveBrowserOnError(error: unknown, headless: boolean): boolea
   return classifyPreservedBrowserError(error, headless) !== null;
 }
 
+function normalizeAuthenticatedModelSelectionError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
 function shouldKeepLocalBrowserOpen(options: {
   effectiveKeepBrowser: boolean;
   preserveBrowserOnError: boolean;
@@ -1475,12 +1479,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           },
         ),
       ).catch((error) => {
-        const base = error instanceof Error ? error.message : String(error);
-        const hint =
-          appliedCookies === 0
-            ? " No cookies were applied; log in to ChatGPT in Chrome or provide inline cookies (--browser-inline-cookies[(-file)] or ORACLE_BROWSER_COOKIES_JSON)."
-            : "";
-        throw new Error(`${base}${hint}`);
+        // Login has already been verified above. Preserve the picker failure instead of
+        // misdiagnosing an unavailable model as missing cookies.
+        throw normalizeAuthenticatedModelSelectionError(error);
       });
       await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
       logger(
@@ -1815,7 +1816,13 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       if (conversationUrl && isConversationUrl(conversationUrl)) {
         logger(`[browser] Rechecking assistant response at ${conversationUrl}`);
         await raceWithDisconnect(Page.navigate({ url: conversationUrl }));
-        await raceWithDisconnect(delay(1000));
+        await raceWithDisconnect(
+          waitForResumedConversationHydration(Runtime, recheckTimeoutMs || 30_000, logger, {
+            requirePriorTurns: true,
+            requirePromptReady: false,
+            expectedConversationUrl: conversationUrl,
+          }),
+        );
       }
       // Validate session before attempting recheck - sessions can expire during the delay
       const sessionValid = await validateChatGPTSession(Runtime, logger);
@@ -3336,7 +3343,11 @@ async function runRemoteBrowserMode(
         lastUrl = conversationUrl;
         logger(`[browser] Rechecking assistant response at ${conversationUrl}`);
         await Page.navigate({ url: conversationUrl });
-        await delay(1000);
+        await waitForResumedConversationHydration(Runtime, recheckTimeoutMs || 30_000, logger, {
+          requirePriorTurns: true,
+          requirePromptReady: false,
+          expectedConversationUrl: conversationUrl,
+        });
       }
       // Validate session before attempting recheck - sessions can expire during the delay
       const sessionValid = await validateChatGPTSession(Runtime, logger);
@@ -3852,10 +3863,12 @@ export const __test__ = {
   isManualLoginProfileInitialized,
   isImageOnlyUiChromeText,
   listIgnoredRemoteChromeFlags,
+  normalizeAuthenticatedModelSelectionError,
   resolveManualLoginWaitMs,
   shouldCleanupBlankTabsAfterLastLease,
   shouldCloseOwnedRunTargetAfterRun,
   shouldKeepLocalBrowserOpen,
+  waitForAssistantResponseWithReload,
 };
 export { syncCookies } from "./cookies.js";
 export {
@@ -3928,7 +3941,11 @@ async function waitForAssistantResponseWithReload(
     }
     logger("Assistant response stalled; reloading conversation and retrying once");
     await Page.navigate({ url: conversationUrl });
-    await delay(1000);
+    await waitForResumedConversationHydration(Runtime, timeoutMs, logger, {
+      requirePriorTurns: true,
+      requirePromptReady: false,
+      expectedConversationUrl: conversationUrl,
+    });
     return await waitForAssistantResponse(
       Runtime,
       timeoutMs,

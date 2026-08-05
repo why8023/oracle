@@ -655,6 +655,28 @@ describe("waitForResumedConversationHydration", () => {
     }
   });
 
+  test("does not wait for an enabled composer when hydrating an active recovery", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({ result: { value: 2 } }),
+      } as unknown as ChromeClient["Runtime"];
+      const ensurePromptReadyMock = vi.fn().mockRejectedValue(new Error("composer disabled"));
+
+      const promise = waitForResumedConversationHydration(runtime, 5_000, logger, {
+        ensurePromptReady: ensurePromptReadyMock,
+        requirePriorTurns: true,
+        requirePromptReady: false,
+      });
+      await vi.runAllTimersAsync();
+
+      await expect(promise).resolves.toBe(2);
+      expect(ensurePromptReadyMock).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("fails closed when navigation lands on a different conversation", async () => {
     vi.useFakeTimers();
     try {

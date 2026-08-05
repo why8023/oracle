@@ -10,6 +10,7 @@ import {
   ensureNotBlocked,
   ensureLoggedIn,
   ensurePromptReady,
+  waitForResumedConversationHydration,
 } from "./pageActions.js";
 import type { BrowserLogger, ChromeClient } from "./types.js";
 import {
@@ -47,6 +48,7 @@ export interface ReattachDeps {
   waitForAssistantResponse?: typeof waitForAssistantResponse;
   captureAssistantMarkdown?: typeof captureAssistantMarkdown;
   waitForDeepResearchCompletion?: typeof waitForDeepResearchCompletion;
+  waitForConversationHydration?: typeof waitForResumedConversationHydration;
   recoverSession?: (
     runtime: BrowserRuntimeMetadata,
     config: BrowserSessionConfig | undefined,
@@ -174,6 +176,17 @@ export async function resumeBrowserSession(
       "Reattach target did not respond",
     );
     await ensureConversationOpen();
+    const waitForHydration =
+      deps.waitForConversationHydration ?? waitForResumedConversationHydration;
+    const expectedConversationUrl = buildConversationUrl(
+      runtime,
+      resolveBrowserConfig(config ?? {}).url,
+    );
+    await waitForHydration(Runtime, timeoutMs, logger, {
+      requirePriorTurns: true,
+      requirePromptReady: false,
+      expectedConversationUrl: expectedConversationUrl ?? undefined,
+    });
     const minTurnIndex =
       (await readPromptPreviewTurnIndex(Runtime, deps.promptPreview)) ??
       (deps.promptPreview ? null : await readConversationTurnIndex(Runtime, logger));
@@ -347,6 +360,12 @@ async function resumeBrowserSessionViaNewChrome(
     await waitForLocationChange(Runtime, 15_000);
   }
 
+  const waitForHydration = deps.waitForConversationHydration ?? waitForResumedConversationHydration;
+  await waitForHydration(Runtime, resolved.inputTimeoutMs, logger, {
+    requirePriorTurns: true,
+    requirePromptReady: false,
+    expectedConversationUrl: conversationUrl ?? undefined,
+  });
   const waitForResponse = deps.waitForAssistantResponse ?? waitForAssistantResponse;
   const captureMarkdown = deps.captureAssistantMarkdown ?? captureAssistantMarkdown;
   const timeoutMs = resolved.timeoutMs ?? 120_000;
