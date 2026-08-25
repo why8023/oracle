@@ -221,6 +221,7 @@ export async function runBrowserPreview(
   log(chalk.cyan(headerLine));
   logBrowserControlPlan(browserConfig, log, "preview");
   logBrowserFollowUpSummary(runOptions.browserFollowUps, log, "preview");
+  logBrowserCookieStrategy(browserConfig, log, "preview");
   logBrowserFileSummary(artifacts, log, "preview");
   if (previewMode === "json" || previewMode === "full") {
     const attachmentSummary = artifacts.attachments.map((attachment) => ({

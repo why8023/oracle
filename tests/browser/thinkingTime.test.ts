@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
+import type { ThinkingTimeLevel } from "../../src/oracle/types.js";
 import {
+  ThinkingTierUnavailableError,
   buildThinkingTimeExpressionForTest,
   ensureThinkingTime,
+  ensureThinkingTimeIfAvailable,
   inferThinkingTargetModelKindForTest,
 } from "../../src/browser/actions/thinkingTime.js";
 
@@ -71,10 +74,13 @@ describe("browser thinking-time selection expression", () => {
     expect(expression).toContain("model-kind-not-found");
   });
 
-  it("preserves Chinese thinking-effort labels while normalizing", () => {
+  it("preserves Chinese and Japanese labels while normalizing", () => {
     const expression = buildThinkingTimeExpressionForTest("extra-high");
-    expect(expression).toContain("\\u4e00-\\u9fa5");
+    expect(expression).toContain("\\u3040-\\u30ff");
+    expect(expression).toContain("\\u4e00-\\u9fff");
     expect(expression).toContain("'极高'");
+    expect(expression).toContain("'推論レベル'");
+    expect(expression).toContain("'思考量'");
   });
 
   it("infers target model kind with token matching", () => {
@@ -331,7 +337,7 @@ describe("browser thinking-time selection expression", () => {
       ),
     ).resolves.toBeUndefined();
 
-    expect(logs.at(-1)).toContain("continuing with ChatGPT default");
+    expect(logs.at(-1)).toContain("keeping the effort already selected in ChatGPT");
   });
 
   it("drives ChatGPT's new Intelligence effort picker for Pro Extended", () => {
@@ -611,7 +617,8 @@ describe("browser thinking-time selection expression", () => {
         FakeMouseEvent,
         FakeElement,
       ),
-    ).resolves.toEqual({ status: "switched", label: "Pro" });
+      // No heavy label in the menu: keep whatever is selected instead of switching to Pro.
+    ).resolves.toMatchObject({ status: "option-not-found" });
 
     const competingProAttributes: Record<string, string> = {
       role: "menuitemradio",
@@ -675,23 +682,18 @@ describe("browser thinking-time selection expression", () => {
         FakeMouseEvent,
         FakeElement,
       ),
-    ).resolves.toEqual({ status: "switched", label: "Pro" });
+      // Extra High is not a heavy label either, so Pro must not be hijacked.
+    ).resolves.toMatchObject({ status: "option-not-found" });
 
     const extraHighAttributes: Record<string, string> = {
       role: "menuitemradio",
       "aria-checked": "false",
       "data-state": "unchecked",
     };
-    const selectableExtraHigh = new FakeElement(
-      "Extra High",
-      extraHighAttributes,
-      [],
-      null,
-      () => {
-        extraHighAttributes["aria-checked"] = "true";
-        extraHighAttributes["data-state"] = "checked";
-      },
-    );
+    const selectableExtraHigh = new FakeElement("Extra High", extraHighAttributes, [], null, () => {
+      extraHighAttributes["aria-checked"] = "true";
+      extraHighAttributes["data-state"] = "checked";
+    });
     const extraHighItems = [
       selectableExtraHigh,
       new FakeElement("Pro", {
@@ -1025,6 +1027,185 @@ describe("browser thinking-time selection expression", () => {
       ).resolves.toEqual({ status: "switched", label: testCase.label });
       expect(clickedLabel).toBe(testCase.label);
       expect(unrelatedPillClicks).toBe(0);
+    }
+  });
+
+  it("selects German Intelligence tiers and keeps Hoch distinct from Sehr hoch", async () => {
+    class FakeEventTarget {
+      dispatchEvent(_event: unknown): boolean {
+        return true;
+      }
+    }
+    class FakeElement extends FakeEventTarget {
+      constructor(
+        public textContent: string,
+        private readonly attributes: Record<string, string> = {},
+        private readonly children: FakeElement[] = [],
+        private readonly nestedIntelligence: FakeElement | null = null,
+        private readonly onDispatch?: () => void,
+      ) {
+        super();
+      }
+      getAttribute(name: string): string | null {
+        return this.attributes[name] ?? null;
+      }
+      setAttribute(name: string, value: string): void {
+        this.attributes[name] = value;
+      }
+      querySelector(selector: string): FakeElement | null {
+        return selector.includes("composer-intelligence-picker-content")
+          ? this.nestedIntelligence
+          : null;
+      }
+      querySelectorAll(_selector: string): FakeElement[] {
+        return this.children;
+      }
+      closest(_selector: string): FakeElement | null {
+        return null;
+      }
+      matches(selector: string): boolean {
+        return (
+          selector.includes("__composer-pill") &&
+          this.attributes.class?.includes("__composer-pill") === true
+        );
+      }
+      focus(): void {}
+      getBoundingClientRect(): { width: number; height: number } {
+        return { width: 144, height: 36 };
+      }
+      override dispatchEvent(event: unknown): boolean {
+        this.onDispatch?.();
+        return super.dispatchEvent(event);
+      }
+    }
+    class FakeMouseEvent {
+      constructor(
+        public readonly type: string,
+        public readonly init?: unknown,
+      ) {}
+    }
+
+    const GERMAN_TIERS = ["Sofort", "Mittel", "Hoch", "Sehr hoch"];
+    const cases: Array<{ level: ThinkingTimeLevel; label: string | null; tiers: string[] }> = [
+      { level: "light", label: "Sofort", tiers: GERMAN_TIERS },
+      { level: "standard", label: "Mittel", tiers: GERMAN_TIERS },
+      { level: "extended", label: "Hoch", tiers: GERMAN_TIERS },
+      { level: "extra-high", label: "Sehr hoch", tiers: GERMAN_TIERS },
+      // Sehr hoch must never satisfy `extended`, even when it is the only high tier.
+      { level: "extended", label: null, tiers: ["Sofort", "Mittel", "Sehr hoch"] },
+      // ...nor may Hoch satisfy `extra-high` when Sehr hoch is absent.
+      { level: "extra-high", label: null, tiers: ["Sofort", "Mittel", "Hoch"] },
+      // Row descriptions must not decide the tier: "sehr" inside Hoch's description
+      // may not disqualify it, and "Hochladen" may not stand in for Hoch.
+      {
+        level: "extended",
+        label: "Hoch – für sehr komplexe Aufgaben",
+        tiers: ["Sofort", "Mittel", "Hoch – für sehr komplexe Aufgaben", "Sehr hoch"],
+      },
+      { level: "extended", label: null, tiers: ["Sofort", "Mittel", "Hochladen"] },
+      {
+        level: "standard",
+        label: "Mittel – ausgewogene Denkdauer",
+        tiers: ["Sofort", "Mittel – ausgewogene Denkdauer", "Hoch", "Sehr hoch"],
+      },
+      { level: "standard", label: null, tiers: ["Sofort", "Ermitteln", "Hoch"] },
+    ];
+
+    for (const testCase of cases) {
+      let clickedLabel: string | null = null;
+      const makeRadio = (label: string) => {
+        const radio = new FakeElement(
+          label,
+          { role: "menuitemradio", "aria-checked": "false", "data-state": "unchecked" },
+          [],
+          null,
+          () => {
+            clickedLabel = label;
+            radio.setAttribute("aria-checked", "true");
+            radio.setAttribute("data-state", "checked");
+          },
+        );
+        return radio;
+      };
+      const effortItems = [
+        ...testCase.tiers.map(makeRadio),
+        new FakeElement("Pro", {
+          role: "menuitemradio",
+          "aria-checked": "false",
+          "data-state": "unchecked",
+        }),
+        new FakeElement("GPT-5.6", { role: "menuitem", "aria-haspopup": "menu" }),
+      ];
+      const intelligenceGroup = new FakeElement(
+        `Intelligenz ${effortItems.map((item) => item.textContent).join(" ")}`,
+        { "data-testid": "composer-intelligence-picker-content", role: "group" },
+        effortItems,
+      );
+      const outerMenu = new FakeElement(
+        intelligenceGroup.textContent,
+        { role: "menu" },
+        effortItems,
+        intelligenceGroup,
+      );
+      const modelButton = new FakeElement("Hoch", {
+        class: "__composer-pill",
+        "aria-expanded": "true",
+        "aria-haspopup": "menu",
+      });
+      const documentStub = {
+        body: new FakeElement(""),
+        querySelector: (selector: string) => {
+          if (selector.includes("composer-intelligence-pro-thinking-effort-trigger")) return null;
+          if (selector.includes("composer-intelligence-picker-content")) return intelligenceGroup;
+          if (
+            selector.includes("model-switcher-dropdown-button") ||
+            selector.includes("__composer-pill")
+          ) {
+            return modelButton;
+          }
+          return null;
+        },
+        querySelectorAll: (selector: string) => {
+          if (selector.includes("__composer-pill")) return [modelButton];
+          if (selector.includes('role="menu"') || selector.includes("data-radix")) {
+            return [outerMenu];
+          }
+          return [];
+        },
+        dispatchEvent: () => true,
+      };
+      let now = 0;
+      const performanceStub = { now: () => (now += 100) };
+      const evaluate = new Function(
+        "document",
+        "performance",
+        "setTimeout",
+        "window",
+        "EventTarget",
+        "PointerEvent",
+        "MouseEvent",
+        "HTMLElement",
+        `return ${buildThinkingTimeExpressionForTest(testCase.level, "GPT-5.6")};`,
+      ) as (...args: unknown[]) => Promise<unknown>;
+
+      const result = (await evaluate(
+        documentStub,
+        performanceStub,
+        (callback: () => void) => callback(),
+        { PointerEvent: FakeMouseEvent, MouseEvent: FakeMouseEvent, Event: FakeMouseEvent },
+        FakeEventTarget,
+        FakeMouseEvent,
+        FakeMouseEvent,
+        FakeElement,
+      )) as { status: string; label?: string | null };
+      if (testCase.label === null) {
+        expect(result.status).toBe("option-not-found");
+        expect(clickedLabel).toBeNull();
+      } else {
+        expect(result.status).toBe("switched");
+        expect(result.label).toBe(testCase.label);
+        expect(clickedLabel).toBe(testCase.label);
+      }
     }
   });
 
@@ -2537,5 +2718,846 @@ describe("browser thinking-time selection expression", () => {
         FakeElement,
       ),
     ).resolves.toEqual({ status: "switched", label: "Instant" });
+  });
+});
+
+describe("unified Intelligence picker with Advanced -> Effort submenu", () => {
+  // Mirrors the ChatGPT layout observed 2026-08-07: a "power" slider in the simple
+  // view, with the effort tiers reachable only through Advanced -> Effort.
+  class FakeEventTarget {
+    dispatchEvent(_event: unknown): boolean {
+      return true;
+    }
+  }
+
+  class Node extends FakeEventTarget {
+    public readonly children: Node[];
+    private readonly attrs: Record<string, string>;
+    public clicks = 0;
+
+    constructor(
+      public textContent: string,
+      attrs: Record<string, string> = {},
+      children: Node[] = [],
+      private readonly onClick?: (self: Node) => void,
+    ) {
+      super();
+      this.attrs = { ...attrs };
+      this.children = children;
+    }
+
+    get parentElement(): Node | null {
+      return null;
+    }
+
+    getAttribute(name: string): string | null {
+      return this.attrs[name] ?? null;
+    }
+
+    setAttribute(name: string, value: string): void {
+      this.attrs[name] = value;
+    }
+
+    private matchesSelector(selector: string): boolean {
+      const role = this.attrs.role ?? "";
+      const testid = this.attrs["data-testid"] ?? "";
+      if (selector.includes('[role="menuitem"][aria-haspopup="menu"]')) {
+        return role === "menuitem" && this.attrs["aria-haspopup"] === "menu";
+      }
+      if (selector.includes("composer-model-picker-slider-advanced-view")) {
+        return testid === "composer-model-picker-slider-advanced-view";
+      }
+      if (selector.includes("composer-intelligence-picker-content")) {
+        return testid === "composer-intelligence-picker-content";
+      }
+      if (selector.includes('role="menuitemradio"') && role === "menuitemradio") return true;
+      if (selector.includes('role="menuitem"'))
+        return role === "menuitem" || role === "menuitemradio";
+      if (selector.includes('role="menu"')) return role === "menu";
+      return false;
+    }
+
+    private descendants(): Node[] {
+      return this.children.flatMap((child) => [child, ...child.descendants()]);
+    }
+
+    querySelector(selector: string): Node | null {
+      return this.descendants().find((node) => node.matchesSelector(selector)) ?? null;
+    }
+
+    querySelectorAll(selector: string): Node[] {
+      return this.descendants().filter((node) => node.matchesSelector(selector));
+    }
+
+    closest(_selector: string): Node | null {
+      return null;
+    }
+
+    matches(selector: string): boolean {
+      if (selector.includes("__composer-pill")) {
+        return (this.attrs.class ?? "").includes("__composer-pill");
+      }
+      return this.matchesSelector(selector);
+    }
+
+    contains(node: unknown): boolean {
+      return this.descendants().includes(node as Node);
+    }
+
+    getBoundingClientRect(): { width: number; height: number } {
+      return { width: 40, height: 20 };
+    }
+
+    override dispatchEvent(event: unknown): boolean {
+      if (String((event as { type?: string }).type) === "click") {
+        this.clicks += 1;
+        this.onClick?.(this);
+      }
+      return super.dispatchEvent(event);
+    }
+  }
+
+  class FakeMouseEvent {
+    constructor(
+      public readonly type: string,
+      public readonly init?: unknown,
+    ) {}
+  }
+
+  // The probe closes menus with a real KeyboardEvent, so the harness must provide
+  // one: without it the constructor throws inside the probe's try/catch and no
+  // Escape is ever observable, which is what let the tooltip-layer bug hide.
+  class FakeKeyboardEvent {
+    public readonly key: string;
+    constructor(
+      public readonly type: string,
+      init: { key?: string } = {},
+    ) {
+      this.key = init.key ?? "";
+    }
+  }
+
+  function buildDom(currentTier: string) {
+    const tierNames = ["Instant", "Medium", "High", "Extra High", "Pro"];
+    let selectedTier = currentTier;
+    const tierRows = tierNames.map(
+      (name) =>
+        new Node(
+          name,
+          { role: "menuitemradio", "aria-checked": name === selectedTier ? "true" : "false" },
+          [],
+          (self) => {
+            selectedTier = name;
+            for (const row of tierRows) {
+              row.setAttribute("aria-checked", row === self ? "true" : "false");
+            }
+          },
+        ),
+    );
+    const submenu = new Node(
+      "InstantMediumHighExtra HighPro",
+      { role: "menu", id: "effort-submenu" },
+      tierRows,
+    );
+
+    // The submenu is portalled in only once its opener is activated, so a descent
+    // that never really opens it cannot quietly pass by reading it up front.
+    let submenuOpen = false;
+    const effortOpener = new Node(
+      `Effort${selectedTier}`,
+      {
+        role: "menuitem",
+        "aria-haspopup": "menu",
+        "aria-controls": "effort-submenu",
+        "data-state": "closed",
+      },
+      [],
+      (self) => {
+        submenuOpen = true;
+        self.setAttribute("aria-expanded", "true");
+      },
+    );
+    const modelOpener = new Node("ModelGPT-5.6 Sol", {
+      role: "menuitem",
+      "aria-haspopup": "menu",
+      "data-state": "closed",
+    });
+    const advancedView = new Node(
+      "ModelGPT-5.6 SolEffortHigh",
+      { "data-testid": "composer-model-picker-slider-advanced-view" },
+      [modelOpener, effortOpener],
+    );
+    const advancedToggle = new Node("Advanced", {
+      role: "menuitem",
+      "aria-label": "Show advanced options",
+      "aria-expanded": "false",
+    });
+    const slider = new Node("", { role: "menuitem", "aria-label": "Power" });
+    const pickerContent = new Node(
+      "High, 3 of 5.AdvancedFasterSmarter",
+      { "data-testid": "composer-intelligence-picker-content", role: "group" },
+      [slider, advancedToggle, advancedView],
+    );
+    const topMenu = new Node("High, 3 of 5.Advanced", { role: "menu" }, [pickerContent]);
+    const pill = new Node(currentTier, {
+      class: "__composer-pill",
+      "aria-expanded": "true",
+      "aria-haspopup": "menu",
+    });
+
+    const documentStub = {
+      body: new Node(""),
+      getElementById: (id: string) => (id === "effort-submenu" && submenuOpen ? submenu : null),
+      querySelector: (selector: string) => {
+        if (selector.includes("composer-intelligence-pro-thinking-effort-trigger")) return null;
+        if (selector.includes("composer-intelligence-picker-content")) return pickerContent;
+        if (selector.includes("__composer-pill")) return pill;
+        return null;
+      },
+      querySelectorAll: (selector: string) => {
+        if (selector.includes("__composer-pill")) return [pill];
+        if (selector.includes('role="menu"') || selector.includes("data-radix")) {
+          return submenuOpen ? [topMenu, submenu] : [topMenu];
+        }
+        if (selector.includes('role="menuitem"'))
+          return [advancedToggle, modelOpener, effortOpener];
+        return [];
+      },
+      dispatchEvent: () => true,
+    };
+    return {
+      documentStub,
+      advancedToggle,
+      effortOpener,
+      modelOpener,
+      tierRows,
+      getSelectedTier: () => selectedTier,
+    };
+  }
+
+  function run(documentStub: unknown, level: string, model: string | null = "gpt-5.6-sol") {
+    let now = 0;
+    const performanceStub = {
+      now: () => {
+        now += 50;
+        return now;
+      },
+    };
+    const evaluate = new Function(
+      "document",
+      "performance",
+      "setTimeout",
+      "window",
+      "EventTarget",
+      "PointerEvent",
+      "MouseEvent",
+      "HTMLElement",
+      "KeyboardEvent",
+      `return ${buildThinkingTimeExpressionForTest(level as ThinkingTimeLevel, model)};`,
+    ) as (...args: unknown[]) => Promise<{ status: string; label: string | null }>;
+    return evaluate(
+      documentStub,
+      performanceStub,
+      (callback: () => void) => callback(),
+      { PointerEvent: FakeMouseEvent, MouseEvent: FakeMouseEvent, Event: FakeMouseEvent },
+      FakeEventTarget,
+      FakeMouseEvent,
+      FakeMouseEvent,
+      Node,
+      FakeKeyboardEvent,
+    );
+  }
+
+  it("selects Pro through the Effort submenu", async () => {
+    const dom = buildDom("High");
+    await expect(run(dom.documentStub, "pro")).resolves.toEqual({
+      status: "switched",
+      label: "Pro",
+    });
+    expect(dom.getSelectedTier()).toBe("Pro");
+  });
+
+  it("selects Pro through Japanese Advanced and Effort labels", async () => {
+    const dom = buildDom("High");
+    dom.advancedToggle.textContent = "詳細設定";
+    dom.advancedToggle.setAttribute("aria-label", "詳細表示にする");
+    dom.modelOpener.textContent = "モデルGPT-5.6 Sol";
+    dom.effortOpener.textContent = "推論レベルHigh";
+    ["最速", "中程度", "高い", "非常に高い", "Pro"].forEach((label, index) => {
+      dom.tierRows[index]!.textContent = label;
+    });
+
+    const result = await run(dom.documentStub, "pro");
+    expect(dom.advancedToggle.clicks).toBeGreaterThan(0);
+    expect(dom.modelOpener.clicks).toBe(0);
+    expect(dom.effortOpener.clicks).toBeGreaterThan(0);
+    expect(result).toEqual({
+      status: "switched",
+      label: "Pro",
+    });
+    expect(dom.getSelectedTier()).toBe("Pro");
+  });
+
+  it("selects Pro through the renamed Japanese effort label", async () => {
+    const dom = buildDom("High");
+    dom.advancedToggle.textContent = "詳細設定";
+    dom.effortOpener.textContent = "思考量High";
+    ["最速", "中程度", "高い", "非常に高い", "Pro"].forEach((label, index) => {
+      dom.tierRows[index]!.textContent = label;
+    });
+
+    const result = await run(dom.documentStub, "pro");
+    expect(dom.effortOpener.clicks).toBeGreaterThan(0);
+    expect(result).toEqual({
+      status: "switched",
+      label: "Pro",
+    });
+    expect(dom.getSelectedTier()).toBe("Pro");
+  });
+
+  it("selects Japanese Extra High without matching High", async () => {
+    const dom = buildDom("High");
+    dom.advancedToggle.textContent = "詳細設定";
+    dom.effortOpener.textContent = "推論レベル高い";
+    ["最速", "中程度", "高い", "非常に高い", "Pro"].forEach((label, index) => {
+      dom.tierRows[index]!.textContent = label;
+    });
+
+    await expect(run(dom.documentStub, "extra-high")).resolves.toEqual({
+      status: "switched",
+      label: "非常に高い",
+    });
+    expect(dom.tierRows[2]!.clicks).toBe(0);
+    expect(dom.tierRows[3]!.clicks).toBeGreaterThan(0);
+  });
+
+  it("expands the collapsed Advanced view before reading the tiers", async () => {
+    const dom = buildDom("High");
+    await run(dom.documentStub, "pro");
+    expect(dom.advancedToggle.clicks).toBeGreaterThan(0);
+  });
+
+  it("reports Pro as already selected without clicking again", async () => {
+    const dom = buildDom("Pro");
+    await expect(run(dom.documentStub, "pro")).resolves.toEqual({
+      status: "already-selected",
+      label: "Pro",
+    });
+    const proRow = dom.tierRows[4];
+    expect(proRow?.clicks).toBe(0);
+  });
+
+  it("still reaches non-Pro tiers through the same submenu", async () => {
+    const dom = buildDom("High");
+    await expect(run(dom.documentStub, "extra-high")).resolves.toEqual({
+      status: "switched",
+      label: "Extra High",
+    });
+    expect(dom.getSelectedTier()).toBe("Extra High");
+  });
+
+  it("never lands on Pro when a lower tier was requested", async () => {
+    const dom = buildDom("Pro");
+    await run(dom.documentStub, "extended");
+    expect(dom.getSelectedTier()).toBe("High");
+  });
+
+  it("descends past a Model opener whose label contains Pro", async () => {
+    // The Model row names the active model and can read "ModelGPT-5.6 Pro". It has
+    // the same shape as the Effort opener, so a Pro request must not click it.
+    const dom = buildDom("High");
+    dom.modelOpener.textContent = "ModelGPT-5.6 Pro";
+    await expect(run(dom.documentStub, "pro")).resolves.toEqual({
+      status: "switched",
+      label: "Pro",
+    });
+    expect(dom.modelOpener.clicks).toBe(0);
+    expect(dom.effortOpener.clicks).toBeGreaterThan(0);
+    expect(dom.getSelectedTier()).toBe("Pro");
+  });
+
+  it("refuses to guess the Effort opener in an unrecognized language", async () => {
+    const dom = buildDom("High");
+    dom.effortOpener.textContent = "Nivå Hög";
+    dom.modelOpener.textContent = "Modell GPT-5.6 Pro";
+    const result = await run(dom.documentStub, "pro");
+    expect(result.status).not.toBe("switched");
+    expect(dom.modelOpener.clicks).toBe(0);
+    expect(dom.getSelectedTier()).toBe("High");
+  });
+
+  it("does not mistake a localized Advanced toggle for an effort tier", async () => {
+    // German "Erweitert" is both the Advanced disclosure label and one of the
+    // `extended` tier tokens. Matching it as a tier would satisfy the flat scan,
+    // skip the descent, and click the toggle instead of an effort row.
+    const dom = buildDom("Instant");
+    dom.advancedToggle.textContent = "Erweitert";
+    await expect(run(dom.documentStub, "extended")).resolves.toEqual({
+      status: "switched",
+      label: "High",
+    });
+    expect(dom.getSelectedTier()).toBe("High");
+    expect(dom.effortOpener.clicks).toBeGreaterThan(0);
+  });
+
+  it("never settles on Pro for a lower tier when no model is supplied", async () => {
+    // With no desiredModel the model kind is inferred from the composer pill. A pill
+    // showing the Pro *effort* must not read as a Pro *model*, or the Pro-row
+    // exclusion lifts and an `extended` request can match a Pro row carrying an
+    // extended token — Chinese "Pro 深度模式" contains 深度, an extended token.
+    const dom = buildDom("Pro");
+    dom.tierRows[4]!.textContent = "Pro 深度模式";
+    const result = await run(dom.documentStub, "extended", null);
+    // Declining to act is fine (the tab stays where it was, and the caller warns).
+    // Reporting Pro as satisfying `extended` is not.
+    expect(dom.tierRows[4]?.clicks).toBe(0);
+    if (result.status === "switched" || result.status === "already-selected") {
+      expect(result.label ?? "").not.toContain("Pro");
+    }
+  });
+
+  it("keeps Pro out of effort-owner classification", () => {
+    // LEVEL_TOKENS classifies controls and menus as effort owners; TARGET_LEVEL_TOKENS
+    // adds Pro for target matching only. Merging them would make a model pill reading
+    // "Pro" look like the effort pill, and a model menu listing Instant/Pro look like
+    // a tier list.
+    const expression = buildThinkingTimeExpressionForTest("pro", "gpt-5.6-sol");
+    const classifier = expression.slice(
+      expression.indexOf("const LEVEL_TOKENS"),
+      expression.indexOf("const TARGET_LEVEL_TOKENS"),
+    );
+    expect(classifier).not.toContain("pro: ['pro']");
+    expect(expression).toContain("const TARGET_LEVEL_TOKENS = { ...LEVEL_TOKENS, pro: ['pro'] }");
+    expect(expression).toContain("Object.values(LEVEL_TOKENS).some((tokens) => matchesTokens");
+  });
+
+  it("fails closed for every unconfirmed explicit Pro status", async () => {
+    // Pro is expensive and rate-limited: an unconfirmed selection must abort rather
+    // than silently submit at whatever cheaper tier the tab happened to be on.
+    const statuses = [
+      "chip-not-found",
+      "menu-not-found",
+      "option-not-found",
+      "selection-unverified",
+      "model-kind-not-found",
+      "unknown-status",
+      undefined,
+    ] as const;
+
+    for (const status of statuses) {
+      const runtime = {
+        evaluate: async () => ({
+          result: { value: status === undefined ? undefined : { status } },
+        }),
+      };
+      await expect(
+        ensureThinkingTime(runtime as never, "pro", (() => {}) as never, "gpt-5.6-sol"),
+      ).rejects.toThrow(/refusing to submit without confirmed Pro\.$/);
+    }
+  });
+
+  it("does not claim the previous effort survived an unverified click", async () => {
+    const lines: string[] = [];
+    const runtime = {
+      evaluate: async () => ({ result: { value: { status: "selection-unverified" } } }),
+    };
+    await ensureThinkingTime(
+      runtime as never,
+      "extended",
+      ((line: string) => lines.push(line)) as never,
+      "gpt-5.6-sol",
+    );
+    const logged = lines.join(" ");
+    expect(logged).toContain("unconfirmed");
+    expect(logged).not.toContain("keeping the effort already selected");
+  });
+
+  it("never touches a tier row while hunting for the opener", async () => {
+    // Regression guard: an opener matcher that accepted a tier row would change the
+    // effort on hover alone, before any click.
+    const dom = buildDom("High");
+    const decoy = dom.tierRows[4];
+    dom.effortOpener.textContent = "Nivå Hög";
+    await run(dom.documentStub, "pro");
+    expect(decoy?.clicks).toBe(0);
+    expect(dom.getSelectedTier()).toBe("High");
+  });
+  type DisabledProbeResult = {
+    status: string;
+    label?: string | null;
+    notice?: string | null;
+    diagnostic?: {
+      menus?: Array<{ items?: Array<Record<string, unknown>> }>;
+    };
+  };
+
+  function disabledDom() {
+    const dom = buildDom("High");
+    const option = dom.tierRows[4]!;
+    option.setAttribute("aria-disabled", "true");
+    option.setAttribute("data-state", "unchecked");
+    return { dom, option };
+  }
+
+  type PickerDomStub = {
+    documentStub: {
+      querySelectorAll: (selector: string) => Node[];
+      getElementById: (id: string) => Node | null;
+      dispatchEvent: (event: unknown) => boolean;
+    };
+  };
+
+  it("keeps closing until the menu is gone when a tooltip layer eats the first Escape", async () => {
+    // Radix tooltip content is its own dismissable layer, and the topmost layer
+    // consumes Escape. One blind Escape would leave the effort menu open, which the
+    // non-strict caller then submits underneath.
+    const { dom } = disabledDom();
+    const stub = dom.documentStub as PickerDomStub["documentStub"];
+    let escapes = 0;
+    let menusOpen = true;
+    stub.dispatchEvent = (event: unknown) => {
+      if (String((event as { key?: string }).key) === "Escape") {
+        escapes += 1;
+        // The first Escape only dismisses the tooltip layer.
+        if (escapes >= 2) menusOpen = false;
+      }
+      return true;
+    };
+    const querySelectorAll = stub.querySelectorAll;
+    stub.querySelectorAll = (selector: string) => {
+      const menuQuery = selector.includes('role="menu"') || selector.includes("data-radix");
+      if (menuQuery && !menusOpen) return [];
+      return querySelectorAll(selector);
+    };
+    await expect(run(dom.documentStub, "pro", "gpt-5.5-pro")).resolves.toMatchObject({
+      status: "option-disabled",
+    });
+    expect(escapes).toBeGreaterThanOrEqual(2);
+    expect(menusOpen).toBe(false);
+  });
+
+  it("uses an already-associated role=tooltip target when this hover adds nothing", async () => {
+    // Pass 3: row-owned but not causal. A tooltip that was already open for this row
+    // is the best evidence available when the hover adds no association, and the
+    // static-description helper deliberately builds a target WITHOUT role=tooltip, so
+    // without this case the third pass is never exercised.
+    const { dom, option } = disabledDom();
+    const described = new Node("Limit reached. Try again after Aug 16, 2026.");
+    described.setAttribute("role", "tooltip");
+    option.setAttribute("aria-describedby", "open-tip");
+    const getElementById = dom.documentStub.getElementById;
+    dom.documentStub.getElementById = (id: string) =>
+      id === "open-tip" ? described : getElementById(id);
+    await expect(run(dom.documentStub, "pro", "gpt-5.5-pro")).resolves.toMatchObject({
+      status: "option-disabled",
+      notice: "Limit reached. Try again after Aug 16, 2026.",
+    });
+  });
+
+  // Radix APPENDS its tooltip id to whatever aria-describedby the app already set,
+  // and only while the tooltip is open. This helper reproduces that transition: a
+  // pre-existing description stays, and the tooltip id (plus its node) appears only
+  // after this row is hovered.
+  function appendTooltipOnHover(
+    dom: PickerDomStub,
+    option: Node,
+    id: string,
+    text: string,
+    opts: { role?: string | null; polls?: number } = {},
+  ) {
+    const { role = "tooltip", polls = 2 } = opts;
+    const described = new Node(text);
+    if (role) described.setAttribute("role", role);
+    let hovered = false;
+    let seen = 0;
+    const baseDescribedBy = option.getAttribute("aria-describedby") || "";
+    const originalDispatch = option.dispatchEvent.bind(option);
+    option.dispatchEvent = (event: unknown) => {
+      const type = String((event as { type?: string }).type ?? "");
+      if (type.startsWith("pointer") || type.startsWith("mouse")) {
+        hovered = true;
+        option.setAttribute("aria-describedby", `${baseDescribedBy} ${id}`.trim());
+      }
+      return originalDispatch(event);
+    };
+    const getElementById = dom.documentStub.getElementById;
+    dom.documentStub.getElementById = (candidate: string) => {
+      if (candidate !== id) return getElementById(candidate);
+      if (!hovered) return null;
+      seen += 1;
+      return seen >= polls ? described : null;
+    };
+    return described;
+  }
+
+  // A static description the row already carried: row ownership, but not this
+  // hover's reason.
+  function describeStatically(dom: PickerDomStub, option: Node, id: string, text: string) {
+    const described = new Node(text);
+    const existing = option.getAttribute("aria-describedby") || "";
+    option.setAttribute("aria-describedby", `${existing} ${id}`.trim());
+    const getElementById = dom.documentStub.getElementById;
+    dom.documentStub.getElementById = (candidate: string) =>
+      candidate === id ? described : getElementById(candidate);
+    return described;
+  }
+
+  // An unrelated tooltip that mounts DURING this hover, which is what defeats a
+  // novelty-based rule.
+  function addUnrelatedTooltipOnHover(dom: PickerDomStub, option: Node, text: string) {
+    const tooltip = new Node(text);
+    tooltip.setAttribute("role", "tooltip");
+    let hovered = false;
+    const originalDispatch = option.dispatchEvent.bind(option);
+    option.dispatchEvent = (event: unknown) => {
+      const type = String((event as { type?: string }).type ?? "");
+      if (type.startsWith("pointer") || type.startsWith("mouse")) hovered = true;
+      return originalDispatch(event);
+    };
+    const querySelectorAll = dom.documentStub.querySelectorAll;
+    dom.documentStub.querySelectorAll = (selector: string) => {
+      if (!selector.includes('[role="tooltip"]')) return querySelectorAll(selector);
+      return hovered ? [tooltip] : [];
+    };
+    return tooltip;
+  }
+
+  it("returns option-disabled without clicking an aria-disabled row", async () => {
+    const { dom, option } = disabledDom();
+    await expect(run(dom.documentStub, "pro", "gpt-5.5-pro")).resolves.toMatchObject({
+      status: "option-disabled",
+      label: "Pro",
+      notice: null,
+    });
+    expect(option.clicks).toBe(0);
+  });
+
+  it("splits multiple aria-describedby ids on any whitespace", async () => {
+    // Guards the injected /\\s+/: if it ever cooks down to /s+/ the appended id is
+    // never separated from the pre-existing ones and the notice vanishes.
+    const { dom, option } = disabledDom();
+    describeStatically(dom, option, "decoy-a", "Pro is the highest reasoning tier");
+    describeStatically(dom, option, "decoy-b", "Keyboard shortcut");
+    option.setAttribute("aria-describedby", "decoy-a \t decoy-b");
+    appendTooltipOnHover(
+      dom,
+      option,
+      "tier-notice",
+      "Limit reached. Try again after Aug 16, 2026.",
+    );
+    await expect(run(dom.documentStub, "pro", "gpt-5.5-pro")).resolves.toMatchObject({
+      status: "option-disabled",
+      notice: "Limit reached. Try again after Aug 16, 2026.",
+    });
+  });
+
+  it("prefers the tooltip this hover appended over a static description", async () => {
+    // Radix keeps an app-supplied description and appends its own id, so mere
+    // presence of aria-describedby proves the ROW but not the REASON. Returning the
+    // static blurb would hand the caller a confident wrong answer.
+    const { dom, option } = disabledDom();
+    describeStatically(dom, option, "tier-help", "Pro is the highest reasoning tier");
+    appendTooltipOnHover(
+      dom,
+      option,
+      "tier-notice",
+      "Limit reached. Try again after Aug 16, 2026.",
+    );
+    await expect(run(dom.documentStub, "pro", "gpt-5.5-pro")).resolves.toMatchObject({
+      status: "option-disabled",
+      notice: "Limit reached. Try again after Aug 16, 2026.",
+    });
+  });
+
+  it("ignores an unrelated tooltip that opens during this hover", async () => {
+    const { dom, option } = disabledDom();
+    // Novelty is not ownership: another control's armed open-delay can fire inside
+    // this hover's window, and its date has nothing to do with this tier.
+    addUnrelatedTooltipOnHover(dom, option, "Limit reached. Try again after Dec 31, 2099.");
+    await expect(run(dom.documentStub, "pro", "gpt-5.5-pro")).resolves.toMatchObject({
+      status: "option-disabled",
+      notice: null,
+    });
+  });
+
+  it("lets the appended association win over a static title", async () => {
+    // title is consulted only after the association poll expires, so a permanent
+    // tooltip attribute cannot preempt the real reason while it is still mounting.
+    const { dom, option } = disabledDom();
+    option.setAttribute("title", "Highest reasoning tier");
+    // polls high enough that the association is still mounting across several poll
+    // iterations: with a lower value the tooltip resolves inside the first
+    // iteration and the test could not detect a title that preempts it.
+    appendTooltipOnHover(
+      dom,
+      option,
+      "tier-notice",
+      "Limit reached. Try again after Aug 16, 2026.",
+      {
+        polls: 6,
+      },
+    );
+    await expect(run(dom.documentStub, "pro", "gpt-5.5-pro")).resolves.toMatchObject({
+      status: "option-disabled",
+      notice: "Limit reached. Try again after Aug 16, 2026.",
+    });
+  });
+
+  it("falls back to the row's title attribute when nothing associates", async () => {
+    const { dom, option } = disabledDom();
+    option.setAttribute("title", "Limit reached. Try again after Aug 16, 2026.");
+    await expect(run(dom.documentStub, "pro", "gpt-5.5-pro")).resolves.toMatchObject({
+      status: "option-disabled",
+      notice: "Limit reached. Try again after Aug 16, 2026.",
+    });
+  });
+
+  it("redacts the disabled row's label", async () => {
+    const { dom, option } = disabledDom();
+    option.textContent = "Pro  contact\nsupport@example.com now";
+    const result = (await run(dom.documentStub, "pro", "gpt-5.5-pro")) as DisabledProbeResult;
+    expect(result.label).toBe("Pro contact [redacted-email] now");
+  });
+
+  it('treats data-disabled="false" as enabled and still clicks the row', async () => {
+    const dom = buildDom("High");
+    const option = dom.tierRows[4]!;
+    option.setAttribute("data-disabled", "false");
+    const result = (await run(dom.documentStub, "pro", "gpt-5.5-pro")) as DisabledProbeResult;
+    expect(result.status).not.toBe("option-disabled");
+    expect(option.clicks).toBe(1);
+  });
+
+  it("refuses a row that is disabled even while it is the selected effort", async () => {
+    // Deliberate ordering: disabled wins over already-selected. Being checked does
+    // not prove the tier is still usable, and refusing costs nothing, while
+    // submitting may spend a request and come back silently degraded. A future
+    // cleanup that hoists the selected check above the disabled check must fail
+    // here.
+    const dom = buildDom("Pro");
+    const option = dom.tierRows[4]!;
+    option.setAttribute("aria-disabled", "true");
+    const result = (await run(dom.documentStub, "pro", "gpt-5.5-pro")) as DisabledProbeResult;
+    expect(result.status).toBe("option-disabled");
+    expect(option.clicks).toBe(0);
+  });
+  it("returns a null notice when no tooltip renders", async () => {
+    const { dom } = disabledDom();
+    await expect(run(dom.documentStub, "pro", "gpt-5.5-pro")).resolves.toMatchObject({
+      status: "option-disabled",
+      notice: null,
+    });
+  });
+
+  it("includes disabled state attributes in picker diagnostics", async () => {
+    const { dom } = disabledDom();
+    const result = (await run(dom.documentStub, "pro", "gpt-5.5-pro")) as DisabledProbeResult;
+    // The effort rows live in the submenu, so scan every captured menu: the
+    // assertion is about the disabled attributes reaching the diagnostic, not
+    // about which menu index the harness happens to expose them under.
+    const items = (result.diagnostic?.menus ?? []).flatMap((menu) => menu.items ?? []);
+    const item = items.find((entry) => entry.ariaDisabled === "true");
+    expect(item).toMatchObject({ ariaDisabled: "true", dataDisabled: null, disabled: true });
+  });
+
+  it("throws ThinkingTierUnavailableError when disabled Pro is requested", async () => {
+    const runtime = {
+      evaluate: async () => ({
+        result: {
+          value: {
+            status: "option-disabled",
+            label: "Pro",
+            notice: "Limit reached. Try again after Aug 16, 2026.",
+          },
+        },
+      }),
+    };
+    const strictSelection = ensureThinkingTime(
+      runtime as never,
+      "pro",
+      (() => {}) as never,
+      "gpt-5.5-pro",
+    );
+    await expect(strictSelection).rejects.toBeInstanceOf(ThinkingTierUnavailableError);
+    await expect(strictSelection).rejects.toMatchObject({
+      name: "ThinkingTierUnavailableError",
+      category: "browser-automation",
+      message:
+        "Thinking time: Pro is unavailable on this account (Limit reached. Try again after Aug 16, 2026.); refusing to submit without confirmed Pro.",
+      requestedLevel: "pro",
+      requestedLabel: "Pro",
+      optionLabel: "Pro",
+      notice: "Limit reached. Try again after Aug 16, 2026.",
+      confirmedTarget: "Pro",
+      details: {
+        stage: "thinking-tier-unavailable",
+        requestedLevel: "pro",
+        requestedLabel: "Pro",
+        optionLabel: "Pro",
+        notice: "Limit reached. Try again after Aug 16, 2026.",
+        confirmedTarget: "Pro",
+      },
+    });
+
+    const logs: string[] = [];
+    await expect(
+      ensureThinkingTime(
+        runtime as never,
+        "extended",
+        ((line: string) => logs.push(line)) as never,
+        null,
+      ),
+    ).resolves.toBeUndefined();
+    expect(logs.join(" ")).toContain("Limit reached. Try again after Aug 16, 2026.");
+  });
+
+  it("names the requested tier, not a hard-coded one, in the strict error", async () => {
+    // Extended on a Pro model is the other strict path, and its confirmation
+    // target must follow the request instead of being spelled out for Pro alone.
+    const runtime = {
+      evaluate: async () => ({
+        result: {
+          value: {
+            status: "option-disabled",
+            label: "Pro Extended",
+            notice: "Unavailable on this plan.",
+          },
+        },
+      }),
+    };
+    await expect(
+      ensureThinkingTime(runtime as never, "extended", (() => {}) as never, "gpt-5.5-pro"),
+    ).rejects.toMatchObject({
+      name: "ThinkingTierUnavailableError",
+      requestedLevel: "extended",
+      confirmedTarget: "Pro Extended",
+      message: expect.stringContaining("refusing to submit without confirmed Pro Extended"),
+    });
+  });
+
+  it("keeps the current effort when IfAvailable sees a disabled row", async () => {
+    const runtime = {
+      evaluate: async () => ({
+        result: {
+          value: {
+            status: "option-disabled",
+            label: "Pro",
+            notice: "Limit reached. Try again after Aug 16, 2026.",
+          },
+        },
+      }),
+    };
+    const logs: string[] = [];
+    await expect(
+      ensureThinkingTimeIfAvailable(
+        runtime as never,
+        "pro",
+        ((line: string) => logs.push(line)) as never,
+        "gpt-5.5-pro",
+      ),
+    ).resolves.toBe(false);
+    const logged = logs.join(" ");
+    expect(logged).toContain("keeping the effort already selected in ChatGPT");
+    expect(logged).not.toContain("continuing with default");
   });
 });

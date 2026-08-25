@@ -1,6 +1,6 @@
 {
   "name": "@steipete/oracle",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "description": "CLI wrapper around OpenAI Responses API with GPT-5.6 Sol, GPT-5.6, GPT-5.5 Pro, GPT-5.5, GPT-5.4, GPT-5.2, GPT-5.1, and GPT-5.1 Codex high reasoning modes.",
   "keywords": [],
   "homepage": "https://askoracle.sh",
@@ -58,7 +58,7 @@
   },
   "dependencies": {
     "@anthropic-ai/tokenizer": "^0.0.4",
-    "@google/genai": "^2.15.0",
+    "@google/genai": "^2.16.0",
     "@google/generative-ai": "^0.24.1",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@steipete/sweet-cookie": "^0.4.1",
@@ -69,7 +69,7 @@
     "commander": "^15.0.0",
     "dotenv": "^17.4.2",
     "fast-glob": "^3.3.3",
-    "gpt-tokenizer": "^3.4.0",
+    "gpt-tokenizer": "^4.0.0",
     "inquirer": "14.0.2",
     "json5": "^2.2.3",
     "kleur": "^4.1.5",
@@ -87,15 +87,15 @@
     "@anthropic-ai/tokenizer": "^0.0.4",
     "@types/chrome-remote-interface": "^0.34.0",
     "@types/inquirer": "^9.0.10",
-    "@types/node": "^26.1.2",
-    "@vitest/coverage-v8": "4.1.10",
-    "devtools-protocol": "0.0.1673900",
+    "@types/node": "^26.2.0",
+    "@vitest/coverage-v8": "4.1.11",
+    "devtools-protocol": "0.0.1681094",
     "es-toolkit": "^1.50.0",
     "esbuild": "^0.28.1",
-    "oxfmt": "0.62.0",
+    "oxfmt": "0.64.0",
     "oxlint": "^1.77.0",
     "puppeteer-core": "^25.5.0",
-    "tsx": "^4.23.7",
+    "tsx": "^4.23.11",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   },
@@ -110,5 +110,5 @@
   "engines": {
     "node": ">=24"
   },
-  "packageManager": "pnpm@10.34.5"
+  "packageManager": "pnpm@11.20.0"
 }

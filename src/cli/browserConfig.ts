@@ -22,6 +22,12 @@ const DEFAULT_BROWSER_ATTACHMENT_TIMEOUT_MS = 45_000;
 const DEFAULT_BROWSER_RECHECK_TIMEOUT_MS = 120_000;
 const DEFAULT_BROWSER_AUTO_REATTACH_TIMEOUT_MS = 120_000;
 const DEFAULT_CHROME_PROFILE = "Default";
+const CURRENT_CHATGPT_PRO_ALIASES = new Set([
+  "gpt-5-pro",
+  "gpt-5.1-pro",
+  "gpt-5.2-pro",
+  "gpt-5.4-pro",
+]);
 
 // Ordered array: most specific models first to ensure correct selection.
 // The browser label is passed to the model picker which fuzzy-matches against ChatGPT's UI.
@@ -29,7 +35,7 @@ const BROWSER_MODEL_LABELS: [ModelName, string][] = [
   // Most specific first (e.g., "gpt-5.2-thinking" before "gpt-5.2")
   ["gpt-5.6-sol", "GPT-5.6 Sol"],
   ["gpt-5.6", "GPT-5.6 Sol"],
-  ["gpt-5.5-pro", "Pro"],
+  ["gpt-5.5-pro", "GPT-5.5"],
   ["gpt-5.5-instant", "GPT-5.5 Instant"],
   ["gpt-5.5", "Thinking 5.5"],
   ["gpt-5.4-pro", "Pro"],
@@ -69,6 +75,7 @@ export interface BrowserFlagOptions {
   browserAutoReattachInterval?: string;
   browserAutoReattachTimeout?: string;
   browserCookieWait?: string;
+  browserCookieSync?: boolean;
   browserNoCookieSync?: boolean;
   browserInlineCookiesFile?: string;
   browserCookieNames?: string;
@@ -78,13 +85,16 @@ export interface BrowserFlagOptions {
   browserKeepBrowser?: boolean;
   browserManualLogin?: boolean;
   browserManualLoginProfileDir?: string | null;
+  browserManualLoginCookieSync?: boolean;
   copyProfile?: string;
   remoteHost?: string;
-  /** Thinking time intensity: 'light', 'standard', 'extended', 'extra-high', 'heavy' */
+  /** Thinking time intensity: 'light', 'standard', 'extended', 'extra-high', 'pro', 'heavy' */
   browserThinkingTime?: ThinkingTimeLevel;
   browserResearch?: BrowserResearchMode;
   browserArchive?: BrowserArchiveMode;
   browserModelLabel?: string;
+  /** Original model request before browser alias normalization. */
+  browserRequestedModel?: ModelName;
   browserModelStrategy?: BrowserModelStrategy;
   browserAllowCookieErrors?: boolean;
   remoteChrome?: string;
@@ -112,13 +122,8 @@ export function normalizeChatGptModelForBrowser(model: ModelName): ModelName {
   }
 
   // Pro variants: resolve to the latest Pro model in ChatGPT.
-  if (
-    normalized === "gpt-5-pro" ||
-    normalized === "gpt-5.1-pro" ||
-    normalized === "gpt-5.2-pro" ||
-    normalized === "gpt-5.4-pro"
-  ) {
-    return "gpt-5.5-pro";
+  if (isCurrentChatGptProAlias(normalized)) {
+    return "gpt-5.6-sol";
   }
 
   // Explicit model variants: keep as-is (they have their own browser labels)
@@ -132,6 +137,27 @@ export function normalizeChatGptModelForBrowser(model: ModelName): ModelName {
   }
 
   return model;
+}
+
+export function isCurrentChatGptProAlias(model: string | undefined): boolean {
+  return CURRENT_CHATGPT_PRO_ALIASES.has(model?.trim().toLowerCase() ?? "");
+}
+
+export function resolveDefaultBrowserThinkingTime({
+  model,
+  requestedModel,
+  modelStrategy,
+}: {
+  model: string;
+  requestedModel?: string;
+  modelStrategy?: BrowserModelStrategy;
+}): ThinkingTimeLevel | undefined {
+  const strategy = normalizeBrowserModelStrategy(modelStrategy) ?? DEFAULT_MODEL_STRATEGY;
+  if (strategy !== "select") return undefined;
+  const normalizedModel = normalizeChatGptModelForBrowser(model as ModelName);
+  return isCurrentChatGptProAlias(requestedModel ?? model) || normalizedModel === "gpt-5.5-pro"
+    ? "pro"
+    : undefined;
 }
 
 export async function buildBrowserConfig(
@@ -165,6 +191,13 @@ export async function buildBrowserConfig(
     !isChatGptModel && normalizedOverride.length > 0 && normalizedOverride !== baseModel;
   const modelStrategy =
     normalizeBrowserModelStrategy(options.browserModelStrategy) ?? DEFAULT_MODEL_STRATEGY;
+  const thinkingTime =
+    normalizeThinkingTimeLevel(options.browserThinkingTime) ??
+    resolveDefaultBrowserThinkingTime({
+      model: options.model,
+      requestedModel: options.browserRequestedModel,
+      modelStrategy,
+    });
   assertBrowserModelAvailable(options.model, modelStrategy);
   const cookieNames = parseCookieNames(
     options.browserCookieNames ?? process.env.ORACLE_BROWSER_COOKIE_NAMES,
@@ -176,7 +209,10 @@ export async function buildBrowserConfig(
     envFile: process.env.ORACLE_BROWSER_COOKIES_FILE,
     cwd: process.cwd(),
   });
-  if (inline?.source?.startsWith("home:") && options.browserNoCookieSync !== true) {
+  const chromeCookieSyncRequested =
+    options.browserNoCookieSync !== true &&
+    (options.browserCookieSync === true || options.browserManualLoginCookieSync === true);
+  if (inline?.source?.startsWith("home:") && chromeCookieSyncRequested) {
     inline = undefined;
   }
 
@@ -265,14 +301,21 @@ export async function buildBrowserConfig(
     cookieSyncWaitMs: options.browserCookieWait
       ? parseBrowserDuration(options.browserCookieWait, "--browser-cookie-wait", 0)
       : undefined,
-    cookieSync: options.browserNoCookieSync ? false : undefined,
+    cookieSync: inline?.cookies?.length
+      ? true
+      : options.browserNoCookieSync
+        ? false
+        : options.browserCookieSync === true || options.browserManualLoginCookieSync === true
+          ? true
+          : undefined,
     cookieNames,
     inlineCookies: inline?.cookies,
     inlineCookiesSource: inline?.source ?? null,
-    headless: undefined, // disable headless; Cloudflare blocks it
+    headless: options.browserHeadless === true ? true : undefined,
     keepBrowser: options.browserKeepBrowser ? true : undefined,
     manualLogin: options.browserManualLogin === undefined ? undefined : options.browserManualLogin,
     manualLoginProfileDir: options.browserManualLoginProfileDir ?? undefined,
+    manualLoginCookieSync: inline?.cookies?.length ? true : options.browserManualLoginCookieSync,
     copyProfileSource: options.copyProfile ?? undefined,
     hideWindow: options.browserHideWindow ? true : undefined,
     desiredModel,
@@ -282,7 +325,7 @@ export async function buildBrowserConfig(
     allowCookieErrors: options.browserAllowCookieErrors ?? true,
     remoteChrome,
     browserTabRef: options.browserTab ?? undefined,
-    thinkingTime: normalizeThinkingTimeLevel(options.browserThinkingTime) ?? undefined,
+    thinkingTime,
     researchMode: options.browserResearch === "deep" ? "deep" : "off",
     archiveConversations: options.browserArchive,
   };
@@ -319,7 +362,9 @@ function validateAttachRunningOptions(
   const conflicts = [
     options.browserChromeProfile ? "--browser-chrome-profile" : null,
     options.browserCookiePath ? "--browser-cookie-path" : null,
+    options.browserCookieSync ? "--browser-cookie-sync" : null,
     options.browserNoCookieSync ? "--browser-no-cookie-sync" : null,
+    options.browserHeadless ? "--browser-headless" : null,
     options.browserHideWindow ? "--browser-hide-window" : null,
     options.browserKeepBrowser ? "--browser-keep-browser" : null,
     options.browserManualLogin ? "--browser-manual-login" : null,

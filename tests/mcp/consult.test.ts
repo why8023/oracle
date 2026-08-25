@@ -199,7 +199,7 @@ describe("summarizeModelRunsForConsult", () => {
     });
   });
 
-  test("defaults MCP browser consults to manual login on Windows", () => {
+  test("defaults MCP browser consults to no Chrome cookie copy", () => {
     const config = buildConsultBrowserConfig({
       userConfig: {},
       env: {},
@@ -208,7 +208,92 @@ describe("summarizeModelRunsForConsult", () => {
     });
 
     expect(config.manualLogin).toBe(process.platform === "win32");
-    expect(config.cookieSync).toBe(process.platform !== "win32");
+    expect(config.cookieSync).toBe(false);
+  });
+
+  test("honors explicit cookie sync for ordinary MCP browser consults", () => {
+    const config = buildConsultBrowserConfig({
+      userConfig: { browser: { cookieSync: true, manualLogin: false } },
+      env: {},
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
+    });
+
+    expect(config).toMatchObject({ manualLogin: false, cookieSync: true });
+  });
+
+  test("honors explicit cookie sync for MCP manual-login consults", () => {
+    const config = buildConsultBrowserConfig({
+      userConfig: {
+        browser: {
+          manualLogin: true,
+          manualLoginCookieSync: true,
+        },
+      },
+      env: {},
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
+    });
+
+    expect(config).toMatchObject({
+      manualLogin: true,
+      manualLoginCookieSync: true,
+      cookieSync: true,
+    });
+  });
+
+  test("keeps current Pro alias semantics after MCP model normalization", () => {
+    const config = buildConsultBrowserConfig({
+      userConfig: {},
+      env: {},
+      runModel: "gpt-5.6-sol",
+      inputModel: "gpt-5-pro",
+    });
+
+    expect(config).toMatchObject({
+      desiredModel: "GPT-5.6 Sol",
+      thinkingTime: "pro",
+    });
+  });
+
+  test("lets configured effort override the current Pro alias default", () => {
+    const config = buildConsultBrowserConfig({
+      userConfig: { browser: { thinkingTime: "extended" } },
+      env: {},
+      runModel: "gpt-5.6-sol",
+      inputModel: "gpt-5-pro",
+    });
+
+    expect(config).toMatchObject({
+      desiredModel: "GPT-5.6 Sol",
+      thinkingTime: "extended",
+    });
+  });
+
+  test("does not force Pro effort when the MCP request keeps ChatGPT's current model", () => {
+    const config = buildConsultBrowserConfig({
+      userConfig: {},
+      env: {},
+      runModel: "gpt-5.6-sol",
+      inputModel: "gpt-5-pro",
+      browserModelStrategy: "current",
+    });
+
+    expect(config.thinkingTime).toBeUndefined();
+  });
+
+  test("defaults an explicit historical Pro target to Pro effort", () => {
+    const config = buildConsultBrowserConfig({
+      userConfig: {},
+      env: {},
+      runModel: "gpt-5.5-pro",
+      inputModel: "gpt-5.5-pro",
+    });
+
+    expect(config).toMatchObject({
+      desiredModel: "GPT-5.5",
+      thinkingTime: "pro",
+    });
   });
 
   test("lets explicit consult inputs override config defaults", () => {
@@ -344,7 +429,7 @@ describe("summarizeModelRunsForConsult", () => {
           resolvedEngine: "browser",
           model: "gpt-5.5-pro",
           browser: expect.objectContaining({
-            desiredModel: "Pro",
+            desiredModel: "GPT-5.5",
             thinkingTime: "extended",
             modelStrategy: "select",
             imageOutputPath: path.join(realpathSync(home), "generated", "from-mcp.png"),

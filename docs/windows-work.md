@@ -4,7 +4,7 @@ Read this file whenever you're working from Windows and add new findings so the 
 
 - Browser engine now allowed on Windows; expect more flakiness. If automation fails, rerun with `--engine api --wait` or point `--remote-chrome` to a running Chrome with remote debugging.
 - Chrome DevTools via mcporter: `chrome-devtools` server needs `CHROME_DEVTOOLS_URL` from a live session; without it `mcporter call chrome-devtools.*` fails. Expect this to be unset on Windows unless you bring your own Chrome session/URL.
-- agent-scripts bash helpers: `runner`/`scripts/committer` can fail under PowerShell/CMD because of CRLF and bash expectations. If they explode, run commands directly (`pnpm ...`, `git add/commit`) instead.
+- The agent-scripts `runner` helper can fail under PowerShell/CMD because of CRLF and bash expectations. If it explodes, run commands directly (`pnpm ...`, `git add/commit`) instead.
 - browser-tools binary: not built in `agent-scripts/bin` on Windows; `pnpm tsx scripts/browser-tools.ts` also fails there (no package manifest). Use a macOS-built binary or run from macOS if you need it.
 - Prefer PowerShell + pnpm directly; watch for CRLF warnings when touching tracked files.
 - Keep pnpm's project-local virtual store on Windows. `enableGlobalVirtualStore` links worktrees into the shared `%LOCALAPPDATA%\\pnpm\\store\\v10\\links` tree; removing a temporary Git worktree can mutate that shared store and break later installs. If this happens, confirm with `pnpm store status` and repair with a frozen `pnpm install --force` through mise + Corepack.

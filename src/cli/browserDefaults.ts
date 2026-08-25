@@ -28,6 +28,7 @@ export interface BrowserDefaultsOptions {
   browserAutoReattachInterval?: string | number;
   browserAutoReattachTimeout?: string | number;
   browserCookieWait?: string | number;
+  browserCookieSync?: boolean;
   browserPort?: number;
   browserHeadless?: boolean;
   browserHideWindow?: boolean;
@@ -38,6 +39,7 @@ export interface BrowserDefaultsOptions {
   browserArchive?: BrowserArchiveMode;
   browserManualLogin?: boolean;
   browserManualLoginProfileDir?: string | null;
+  browserManualLoginCookieSync?: boolean;
 }
 
 type SourceGetter = (key: keyof BrowserDefaultsOptions) => string | undefined;
@@ -131,7 +133,10 @@ export function applyBrowserDefaultsFromConfig(
   if (isUnset("browserCookieWait") && typeof browser.cookieSyncWaitMs === "number") {
     options.browserCookieWait = String(browser.cookieSyncWaitMs);
   }
-  if (isUnset("browserHeadless") && browser.headless !== undefined) {
+  if (!attachRunningRequested && isUnset("browserCookieSync") && browser.cookieSync !== undefined) {
+    options.browserCookieSync = browser.cookieSync;
+  }
+  if (!attachRunningRequested && isUnset("browserHeadless") && browser.headless !== undefined) {
     options.browserHeadless = browser.headless;
   }
   if (!attachRunningRequested && isUnset("browserHideWindow") && browser.hideWindow !== undefined) {
@@ -173,5 +178,12 @@ export function applyBrowserDefaultsFromConfig(
     browser.manualLoginProfileDir !== undefined
   ) {
     options.browserManualLoginProfileDir = browser.manualLoginProfileDir;
+  }
+  if (
+    !attachRunningRequested &&
+    isUnset("browserManualLoginCookieSync") &&
+    browser.manualLoginCookieSync !== undefined
+  ) {
+    options.browserManualLoginCookieSync = browser.manualLoginCookieSync;
   }
 }

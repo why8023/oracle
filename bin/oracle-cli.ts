@@ -138,6 +138,7 @@ interface CliOptions extends OptionValues {
   browserProfileLockTimeout?: string;
   browserMaxConcurrentTabs?: string;
   browserCookieWait?: string;
+  browserCookieSync?: boolean;
   browserNoCookieSync?: boolean;
   browserInlineCookiesFile?: string;
   browserCookieNames?: string;
@@ -150,7 +151,7 @@ interface CliOptions extends OptionValues {
   browserManualLogin?: boolean;
   browserManualLoginProfileDir?: string;
   copyProfile?: string;
-  browserThinkingTime?: "light" | "standard" | "extended" | "extra-high" | "heavy";
+  browserThinkingTime?: "light" | "standard" | "extended" | "extra-high" | "pro" | "heavy";
   browserResearch?: "off" | "deep";
   browserFollowUp?: string[];
   browserAllowCookieErrors?: boolean;
@@ -439,7 +440,7 @@ program
   .option("-s, --slug <words>", "Custom session slug (3-5 words).")
   .option(
     "-m, --model <model>",
-    "Model to target (gpt-5.5-pro default). GPT-5.6 aliases gpt-5.6 and gpt-5.6-sol work with the OpenAI API or ChatGPT browser. Browser mode also supports current GPT-5.5/GPT-5.4 targets and legacy Pro aliases; retired GPT-5.2 base/Instant/Thinking aliases are API-only. Other API targets include gpt-5.1-codex, gpt-5.2, gpt-5.2-instant, Gemini, Claude, and custom model IDs.",
+    "Model to target (gpt-5.5-pro default). GPT-5.6 aliases gpt-5.6 and gpt-5.6-sol work with the OpenAI API or ChatGPT browser. In browser mode, generic Pro aliases follow the current GPT-5.6 Sol target; use explicit gpt-5.5-pro to pin GPT-5.5. Retired GPT-5.2 base/Instant/Thinking aliases are API-only. Other API targets include gpt-5.1-codex, gpt-5.2, gpt-5.2-instant, Gemini, Claude, and custom model IDs.",
     normalizeModelOption,
   )
   .addOption(
@@ -763,6 +764,12 @@ program
       "Load inline cookies from file (JSON or base64 JSON).",
     ).hideHelp(),
   )
+  .addOption(
+    new Option(
+      "--browser-cookie-sync",
+      "Copy cookies from live Chrome (opt-in; token rotation may invalidate that session).",
+    ),
+  )
   .addOption(new Option("--browser-no-cookie-sync", "Skip copying cookies from Chrome.").hideHelp())
   .addOption(
     new Option(
@@ -801,7 +808,7 @@ program
   .addOption(
     new Option(
       "--browser-thinking-time <level>",
-      "Thinking time intensity for Thinking/Pro models: light, standard, extended, extra-high (Extra High), heavy (Pro), or ChatGPT UI aliases.",
+      "Thinking time intensity for Thinking/Pro models: light, standard, extended, extra-high (Extra High), pro (Pro tier of the active model), heavy, or ChatGPT UI aliases.",
     )
       .argParser(parseThinkingTimeOption)
       .hideHelp(),
@@ -962,6 +969,11 @@ program
     "--manual-login-profile-dir <path>",
     "Chrome profile directory for manual login (default ~/.oracle/browser-profile).",
   )
+  .option(
+    "--browser-cookie-sync",
+    "Copy cookies from this host's live Chrome profile instead of using the dedicated profile.",
+    false,
+  )
   .action(async (commandOptions) => {
     const { serveRemote } = await import("../src/remote/server.js");
     await serveRemote({
@@ -970,6 +982,7 @@ program
       token: commandOptions.token,
       manualLoginDefault: commandOptions.manualLogin,
       manualLoginProfileDir: commandOptions.manualLoginProfileDir,
+      cookieSyncDefault: commandOptions.browserCookieSync,
     });
   });
 
@@ -1000,6 +1013,10 @@ function addProjectSourcesCommonOptions(command: Command): Command {
     .option("--browser-cookie-path <path>", "Explicit Chrome cookie DB path.")
     .option("--browser-inline-cookies <json>", "Inline ChatGPT cookies JSON.")
     .option("--browser-inline-cookies-file <path>", "File containing ChatGPT cookies JSON.")
+    .option(
+      "--browser-cookie-sync",
+      "Copy cookies from live Chrome (opt-in; token rotation may invalidate that session).",
+    )
     .option("--browser-no-cookie-sync", "Skip copying cookies from Chrome.")
     .option("--browser-keep-browser", "Keep Chrome running after completion.", false)
     .option("--browser-hide-window", "Hide Chrome window after launch on macOS.", false)
@@ -1858,8 +1875,10 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   }
 
   const retentionHours = typeof options.retainHours === "number" ? options.retainHours : undefined;
-  await sessionStore.ensureStorage();
-  await pruneOldSessions(retentionHours, (message) => console.log(chalk.dim(message)));
+  if (!previewMode) {
+    await sessionStore.ensureStorage();
+    await pruneOldSessions(retentionHours, (message) => console.log(chalk.dim(message)));
+  }
   if (providerMode === "openai") {
     if (hasExplicitAzureOption(optionUsesDefault)) {
       throw new Error("--provider openai/--no-azure cannot be combined with Azure options.");
@@ -2146,6 +2165,7 @@ async function runRootCommand(options: CliOptions): Promise<void> {
       ...options,
       remoteHost: remoteHost ?? undefined,
       model: activeModel,
+      browserRequestedModel: cliModelArg,
       browserModelLabel: resolveBrowserModelLabel(cliModelArg, activeModel),
     });
     return resolvedOptions.browserResumeConversationUrl
@@ -2891,6 +2911,10 @@ function printDebugHelp(cliName: string): void {
     [
       "--browser-cookie-wait <ms|s|m>",
       "Wait before retrying cookie sync when Chrome cookies are empty or locked.",
+    ],
+    [
+      "--browser-cookie-sync",
+      "Copy cookies from live Chrome (opt-in; token rotation may invalidate that session).",
     ],
     ["--browser-no-cookie-sync", "Skip copying cookies from your main profile."],
     [

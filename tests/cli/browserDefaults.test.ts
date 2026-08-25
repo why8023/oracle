@@ -60,6 +60,7 @@ describe("applyBrowserDefaultsFromConfig", () => {
         attachmentTimeoutMs: 90_000,
         profileLockTimeoutMs: 90_000,
         maxConcurrentTabs: 4,
+        cookieSync: true,
         cookieSyncWaitMs: 4_000,
         headless: true,
         hideWindow: true,
@@ -78,6 +79,7 @@ describe("applyBrowserDefaultsFromConfig", () => {
     expect(options.browserProfileLockTimeout).toBe("90000");
     expect(options.browserMaxConcurrentTabs).toBe("4");
     expect(options.browserCookieWait).toBe("4000");
+    expect(options.browserCookieSync).toBe(true);
     expect(options.browserHeadless).toBe(true);
     expect(options.browserHideWindow).toBe(true);
     expect(options.browserKeepBrowser).toBe(true);
@@ -222,6 +224,7 @@ describe("applyBrowserDefaultsFromConfig", () => {
       browser: {
         manualLogin: true,
         manualLoginProfileDir: "/tmp/oracle-profile",
+        manualLoginCookieSync: true,
       },
     };
 
@@ -229,6 +232,7 @@ describe("applyBrowserDefaultsFromConfig", () => {
 
     expect(options.browserManualLogin).toBe(true);
     expect(options.browserManualLoginProfileDir).toBe("/tmp/oracle-profile");
+    expect(options.browserManualLoginCookieSync).toBe(true);
   });
 
   test("applies attach-running defaults from config when CLI flags are untouched", () => {
@@ -253,6 +257,8 @@ describe("applyBrowserDefaultsFromConfig", () => {
         attachRunning: false,
         debugPort: 9222,
         timeoutMs: 120_000,
+        headless: true,
+        manualLoginCookieSync: true,
         hideWindow: true,
         keepBrowser: true,
         manualLogin: true,
@@ -269,12 +275,31 @@ describe("applyBrowserDefaultsFromConfig", () => {
     expect(options.browserChromeProfile).toBeUndefined();
     expect(options.browserCookiePath).toBeUndefined();
     expect(options.browserPort).toBeUndefined();
+    expect(options.browserHeadless).toBeUndefined();
+    expect(options.browserManualLoginCookieSync).toBeUndefined();
     expect(options.browserHideWindow).toBeUndefined();
     expect(options.browserKeepBrowser).toBeUndefined();
     expect(options.browserManualLogin).toBeUndefined();
     expect(options.browserManualLoginProfileDir).toBeUndefined();
     expect(options.browserTimeout).toBe("120000");
     expect(options.browserThinkingTime).toBe("extended");
+  });
+
+  test("saved attach-running also skips a saved headless preference", () => {
+    const options: BrowserDefaultsOptions = {};
+    const config: UserConfig = {
+      browser: {
+        attachRunning: true,
+        headless: true,
+        hideWindow: true,
+      },
+    };
+
+    applyBrowserDefaultsFromConfig(options, config, (_key) => "default");
+
+    expect(options.browserAttachRunning).toBe(true);
+    expect(options.browserHeadless).toBeUndefined();
+    expect(options.browserHideWindow).toBeUndefined();
   });
 
   test("does not override manual-login when CLI enabled it", () => {

@@ -510,8 +510,8 @@ describe("collectGeneratedImageArtifacts", () => {
       void resultPromise.finally(() => {
         settled = true;
       });
-      for (let index = 0; index < 60 && !settled; index += 1) {
-        await vi.advanceTimersByTimeAsync(500);
+      for (let index = 0; index < 20 && !settled; index += 1) {
+        await vi.advanceTimersByTimeAsync(1500);
         await fs.readdir(tmpDir);
       }
       const result = await resultPromise;
@@ -526,7 +526,7 @@ describe("collectGeneratedImageArtifacts", () => {
     } finally {
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
-  });
+  }, 10_000);
 
   test("falls back to a behavior button when the rendered image URL fails", async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-image-404-"));

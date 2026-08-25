@@ -1,6 +1,63 @@
 # Changelog
 
-## 0.17.1 — Unreleased
+## Unreleased
+
+### Fixed
+
+- Browser: restore locally launched macOS Chrome windows to their prior placement for visible runs only when Oracle recorded the window before a `--browser-hide-window` run; unmarked windows remain untouched.
+- Browser: archive completed ChatGPT conversations when the interface is Japanese by recognizing the current `その他`, `アーカイブ`, and `アーカイブを解除する` controls.
+- Browser: apply the configured input timeout to prompt preparation so stalled local file assembly fails clearly before launching Chrome. Fixes #381.
+- Browser: report ChatGPT's rate limit as a rate limit. When ChatGPT covers the page with its "Too many requests — we've temporarily limited access to your conversations" modal, the model-switcher scrape walked it like any other menu and reported its "Got it" button as an available model, so a throttled run failed with `Unable to find model option matching "…". Available: Got it` — a message that sends the reader after a model-naming bug when the correct response is to wait a few minutes. Model selection now probes for the notice first and raises a `chatgpt-throttled` error carrying `retryable: true` and the notice text; without a notice the original diagnosis is unchanged.
+
+### Changed
+
+- **Breaking** — Remote: accept only conversation-scoped fields from remote clients. The service overrode six known-dangerous `browserConfig` fields and passed the rest of `BrowserSessionConfig` through to `runBrowserMode` verbatim. The remainder is not inert: `chromePath` names an executable the host spawns, `remoteChrome` a debugger to attach to, `copyProfileSource` a directory to copy a signed-in profile out of, `debugPort` one to expose, and `attachRunning`/`browserTabRef` select an existing ChatGPT tab — with an empty or "current" ref resolving to the first ChatGPT tab in the browser. That makes a bridge token a permission to run code on the host rather than to ask ChatGPT a question. A client may now describe the conversation it wants — URL, model, effort, archive mode, resume target, time budgets — and nothing about the machine. A caller that was setting host-scoped fields is now ignored on them rather than obeyed.
+- Remote: stop advertising addresses the service is not listening on. `oracle serve --host 127.0.0.1` printed the host's LAN and tailnet addresses in its startup banner while bound to loopback only. That banner is how an operator decides whether a port needs a tunnel or a firewall rule, and for browser automation behind a bearer token, erring toward "more exposed than it is" is the wrong direction.
+
+## 0.18.0 — 2026-08-14
+
+### Changed
+
+- Browser: stop copying cookies from a live Chrome profile by default because ChatGPT token rotation can invalidate the user's interactive session. Use the persistent `--browser-manual-login` profile (recommended), inline cookies, or explicitly restore the old behavior with `--browser-cookie-sync` / `browser.cookieSync=true`. Fixes #367.
+- Browser: route the generic current-Pro aliases (`gpt-5-pro`, `gpt-5.1-pro`, `gpt-5.2-pro`, and `gpt-5.4-pro`) to GPT-5.6 Sol with Pro effort. Use the explicit `gpt-5.5-pro` model to keep the historical GPT-5.5 target; an explicit thinking-time setting still overrides the alias default. Fixes #373. Thanks @pdurlej!
+
+### Fixed
+
+- Browser: detect a disabled ChatGPT effort tier (e.g. an exhausted Pro allotment) before clicking it, and report the account's own reset notice instead of a misleading "selection unverified" failure. Thanks @enieuwy!
+
+## 0.17.3 — 2026-08-13
+
+**Highlight:** browser-mode answers and recovery are reliable again — no more
+discarded responses, and authenticated sessions survive a reattach.
+
+### Fixed
+
+- Browser: treat the skip-ahead control labels as placeholder signals only when the entire turn text is short chrome text, so substantial assistant answers that mention those labels are no longer discarded.
+- Browser: align reattach recovery cookie sync with the launch path for manual-login profiles with explicit cookie sync, so recovery can reopen an authenticated conversation with supplied cookies instead of skipping sync. Thanks @enieuwy!
+- Browser: recognize the Japanese `詳細設定` → `推論レベル` controls in ChatGPT's unified Intelligence picker, allowing explicit Pro effort selection without weakening the fail-closed guard for unknown languages. Thanks @kiyo-e!
+- Browser: honor explicit `--browser-headless` for locally launched Chrome/Chromium binaries while preserving the headful default. Explicit `--browser-headless` still conflicts with `--browser-attach-running`; a saved `browser.headless` preference is ignored in attach-running mode. Thanks @enieuwy!
+
+## 0.17.2 — 2026-08-10
+
+**Highlight:** browser mode works with ChatGPT's redesigned model picker again —
+model selection moved under Advanced → Model, and the `gpt-*-pro` aliases now
+select the right model _and_ the Pro effort tier.
+
+### Fixed
+
+- Browser: navigate ChatGPT's unified picker, where the model version lives under Advanced → Model and effort under Advanced → Effort. The `gpt-5.5-pro` family of aliases now resolves to the GPT-5.5 model with Pro thinking time instead of failing against the removed flat menu; an explicit `--browser-thinking-time` still wins (#362, thanks @shivamiitgoa).
+- Security: restrict existing and newly created session transcripts, model metadata, and browser artifacts to the current user, without following symlinks during upgrade hardening. Thanks @bunlongheng!
+
+### Added
+
+- Browser: a `pro` thinking-time level that selects ChatGPT's Pro effort tier on the model it is already using. It fails closed: an unconfirmed selection aborts the run rather than silently submitting at a cheaper tier.
+
+### Changed
+
+- Dependencies: update Google GenAI, Node types, Chrome DevTools protocol, esbuild, tsx, shiki, tokentally (now pricing cached tokens), hono, protobufjs, vite, and related transitives.
+- Developer workflow: remove the obsolete scoped-commit helper and allow standard Git commands in isolated worktrees.
+
+## 0.17.1 — 2026-08-02
 
 ### Changed
 
@@ -8,7 +65,8 @@
 
 ### Fixed
 
-- Browser: keep `--browser-thinking-time extra-high` as Extra High (non-Pro) on GPT-5.6 Sol; reserve `heavy` for explicit Pro selection. Fixes #353.
+- Browser: keep `--browser-thinking-time extra-high` as Extra High (non-Pro) on GPT-5.6 Sol instead of selecting Pro. Fixes #353.
+- Browser: match German Intelligence effort labels with whole-word Latin matching, and keep the currently selected effort when a requested tier has no matching row. Thanks @Jonasdero!
 
 ## 0.17.0 — 2026-08-02
 

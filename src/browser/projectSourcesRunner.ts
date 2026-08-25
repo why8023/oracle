@@ -7,6 +7,7 @@ import {
   connectWithNewTab,
   launchChrome,
   positionChromeWindowOffscreen,
+  positionChromeWindowOnscreen,
   registerTerminationHooks,
 } from "./chromeLifecycle.js";
 import { resolveBrowserConfig } from "./config.js";
@@ -51,6 +52,7 @@ import {
 import { normalizeProjectSourcesUrl } from "../projectSources/url.js";
 import { buildProjectSourcesUploadPlan, diffAddedProjectSources } from "../projectSources/plan.js";
 import type { ProjectSourcesRequest, ProjectSourcesResult } from "../projectSources/types.js";
+import { CHROME_COOKIE_SYNC_WARNING, shouldSyncBrowserCookies } from "./policies.js";
 
 type BrowserChrome = LaunchedChrome & { host?: string };
 
@@ -187,7 +189,9 @@ export async function runBrowserProjectSources(
     }
     await Promise.all(domainEnablers);
     if (!config.headless && config.hideWindow) {
-      await positionChromeWindowOffscreen(client, logger);
+      await positionChromeWindowOffscreen(client, userDataDir, logger);
+    } else if (!config.headless) {
+      await positionChromeWindowOnscreen(client, userDataDir, logger);
     }
     removeDialogHandler = installJavaScriptDialogAutoDismissal(Page, logger);
     if (!manualLogin) {
@@ -335,15 +339,17 @@ async function applyProjectSourcesCookies({
   manualLogin: boolean;
   logger: BrowserLogger;
 }): Promise<number> {
-  const manualLoginCookieSync = manualLogin && Boolean(config.manualLoginCookieSync);
-  const cookieSyncEnabled = config.cookieSync && (!manualLogin || manualLoginCookieSync);
+  const cookieSyncEnabled = shouldSyncBrowserCookies(config, { manualLogin });
   if (!cookieSyncEnabled) {
     logger(
       manualLogin
         ? "Skipping Chrome cookie sync (--browser-manual-login enabled); reuse the opened profile after signing in."
-        : "Skipping Chrome cookie sync (--browser-no-cookie-sync)",
+        : "Skipping Chrome cookie copy (disabled by default; use --browser-cookie-sync to opt in).",
     );
     return 0;
+  }
+  if (!config.inlineCookies) {
+    logger(CHROME_COOKIE_SYNC_WARNING);
   }
   const cookieCount = await syncCookies(network, config.url, config.chromeProfile, logger, {
     allowErrors: config.allowCookieErrors ?? false,

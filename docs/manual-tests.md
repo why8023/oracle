@@ -103,7 +103,7 @@ Debug note: when you have a live ChatGPT tab open under a DevTools port and need
 1. **Prompt Submission & Model Switching**
    - With Chrome signed in and cookie sync enabled, run
      ```bash
-     pnpm run oracle -- --engine browser --model gpt-5.5 \
+     pnpm run oracle -- --engine browser --browser-cookie-sync --model gpt-5.5 \
        --prompt "Line 1\nLine 2\nLine 3"
      ```
    - Observe logs for:
@@ -115,7 +115,7 @@ Debug note: when you have a live ChatGPT tab open under a DevTools port and need
 2. **Markdown Capture**
    - Prompt:
      ```bash
-     pnpm run oracle -- --engine browser --model gpt-5.5 \
+     pnpm run oracle -- --engine browser --browser-cookie-sync --model gpt-5.5 \
        --prompt "Produce a short bullet list with code fencing."
      ```
    - Expected CLI output:
@@ -156,25 +156,29 @@ Document results (pass/fail, session IDs) in PR descriptions so reviewers can au
 Run these four smoke tests whenever we touch browser automation:
 
 1. **GPT-5.5 simple prompt**
-   `pnpm run oracle -- --engine browser --model gpt-5.5 --prompt "Give me two short markdown bullet points about tables"`
+   `pnpm run oracle -- --engine browser --browser-manual-login --model gpt-5.5 --prompt "Give me two short markdown bullet points about tables"`
    Expect two markdown bullets, no files/search referenced. Note the session ID (e.g., `give-me-two-short-markdown`).
 
 2. **GPT-5.5 simple prompt**
-   `pnpm run oracle -- --engine browser --model gpt-5.5 --prompt "List two reasons Markdown is handy"`
+   `pnpm run oracle -- --engine browser --browser-manual-login --model gpt-5.5 --prompt "List two reasons Markdown is handy"`
    Confirm the answer arrives (and only once) even if it takes ~2–3 minutes.
 
 2b. **GPT-5.5 Instant smoke**
-`pnpm run oracle -- --engine browser --model gpt-5.5-instant --prompt "Give me two short markdown bullet points about tables"`
+`pnpm run oracle -- --engine browser --browser-manual-login --model gpt-5.5-instant --prompt "Give me two short markdown bullet points about tables"`
 Expect a near-instant response (no Thinking spinner) and confirm the composer pill shows the "Instant" row, not "Thinking 5.5" or "Pro". Run after any change to the 5.5 picker tokens.
+
+2c. **GPT-5.5 Pro effort through the unified picker**
+`pnpm run oracle -- --engine browser --browser-manual-login --model gpt-5.5-pro --write-output response.txt --prompt "Say Hi!"`
+Confirm the logs report a verified GPT-5.5 model followed by `Thinking time: Pro`, and `response.txt` contains the captured answer. Exercise both a tab starting on another model and a retained tab where GPT-5.5 is already selected. Never click ChatGPT's "Answer now" shortcut while the Pro response is thinking.
 
 3. **GPT-5.5 + attachment**
    Prepare `/tmp/browser-md.txt` with a short note, then run
-   `pnpm run oracle -- --engine browser --model gpt-5.5 --prompt "Summarize the key idea from the attached note" --file /tmp/browser-md.txt`
+   `pnpm run oracle -- --engine browser --browser-manual-login --model gpt-5.5 --prompt "Summarize the key idea from the attached note" --file /tmp/browser-md.txt`
    Ensure upload logs show “Attachment queued” and the answer references the file contents explicitly.
 
 4. **GPT-5.5 + attachment (verbose)**
    Prepare `/tmp/browser-report.txt` with faux metrics, then run
-   `pnpm run oracle -- --engine browser --model gpt-5.5 --prompt "Use the attachment to report current CPU and memory figures" --file /tmp/browser-report.txt --verbose`
+   `pnpm run oracle -- --engine browser --browser-manual-login --model gpt-5.5 --prompt "Use the attachment to report current CPU and memory figures" --file /tmp/browser-report.txt --verbose`
    Verify verbose logs show attachment upload and the final answer matches the file data.
 
 5. **Deep Research smoke**
@@ -250,8 +254,8 @@ Use this when you need to inspect the live ChatGPT composer (DOM state, markdown
 
    ```bash
    tmux new -d -s oracle-browser \\
-     "pnpm run oracle -- --engine browser --browser-keep-browser \\
-      --model 'GPT-5.5 Pro' --prompt 'Debug via DevTools.'"
+     "pnpm run oracle -- --engine browser --browser-manual-login --browser-keep-browser \\
+      --model gpt-5.5 --browser-thinking-time pro --prompt 'Debug via DevTools.'"
    ```
 
    Keeping the run in tmux prevents your shell from blocking and ensures Chrome stays open afterward.

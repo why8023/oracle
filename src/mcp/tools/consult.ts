@@ -32,9 +32,14 @@ import { CONSULT_PRESETS, browserThinkingTimeRawSchema, consultInputSchema } fro
 import { applyConsultPreset } from "../consultPresets.js";
 import { loadUserConfig, type UserConfig } from "../../config.js";
 import { resolveNotificationSettings } from "../../cli/notifier.js";
-import { mapModelToBrowserLabel, resolveBrowserModelLabel } from "../../cli/browserConfig.js";
+import {
+  mapModelToBrowserLabel,
+  resolveBrowserModelLabel,
+  resolveDefaultBrowserThinkingTime,
+} from "../../cli/browserConfig.js";
 import type { BrowserModelStrategy } from "../../browser/types.js";
 import { normalizeThinkingTimeLevel } from "../../oracle/thinkingTime.js";
+import type { ThinkingTimeLevel } from "../../oracle/types.js";
 
 // Use raw shapes so the MCP SDK (with its bundled Zod) wraps them and emits valid JSON Schema.
 const consultInputShape = {
@@ -328,7 +333,7 @@ export function buildConsultBrowserConfig({
   runModel: string;
   inputModel?: string;
   browserModelLabel?: string;
-  browserThinkingTime?: "light" | "standard" | "extended" | "extra-high" | "heavy";
+  browserThinkingTime?: ThinkingTimeLevel;
   browserModelStrategy?: BrowserModelStrategy;
   browserResearchMode?: "deep";
   browserArchive?: "auto" | "always" | "never";
@@ -347,12 +352,15 @@ export function buildConsultBrowserConfig({
     ? true
     : (configuredBrowser.manualLogin ?? process.platform === "win32");
   const configuredThinkingTime = normalizeThinkingTimeLevel(configuredBrowser.thinkingTime);
+  const modelStrategy = browserModelStrategy ?? configuredBrowser.modelStrategy;
 
   return {
     ...configuredBrowser,
     url: configuredUrl,
     chatgptUrl: configuredUrl,
-    cookieSync: !manualLogin,
+    cookieSync: manualLogin
+      ? configuredBrowser.manualLoginCookieSync === true
+      : configuredBrowser.cookieSync === true,
     headless: configuredBrowser.headless ?? false,
     hideWindow: configuredBrowser.hideWindow ?? false,
     keepBrowser: browserKeepBrowser ?? configuredBrowser.keepBrowser ?? false,
@@ -360,8 +368,15 @@ export function buildConsultBrowserConfig({
     manualLoginProfileDir: manualLogin
       ? ((envProfileDir || configuredBrowser.manualLoginProfileDir) ?? null)
       : null,
-    thinkingTime: browserThinkingTime ?? configuredThinkingTime ?? undefined,
-    modelStrategy: browserModelStrategy ?? configuredBrowser.modelStrategy,
+    thinkingTime:
+      browserThinkingTime ??
+      configuredThinkingTime ??
+      resolveDefaultBrowserThinkingTime({
+        model: runModel,
+        requestedModel: inputModel,
+        modelStrategy,
+      }),
+    modelStrategy,
     researchMode: browserResearchMode ?? configuredBrowser.researchMode,
     archiveConversations: browserArchive ?? configuredBrowser.archiveConversations,
     desiredModel: desiredModelLabel || mapModelToBrowserLabel(runModel),

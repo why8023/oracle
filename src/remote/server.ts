@@ -9,6 +9,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdtemp, rm, mkdir, writeFile, stat, realpath } from "node:fs/promises";
 import chalk from "chalk";
 import type { BrowserAttachment, BrowserLogger, CookieParam } from "../browser/types.js";
+import type { BrowserSessionConfig } from "../sessionManager.js";
 import { runBrowserMode } from "../browserMode.js";
 import type { BrowserRunResult } from "../browserMode.js";
 import type {
@@ -45,6 +46,7 @@ export interface RemoteServerOptions {
   logger?: (message: string) => void;
   manualLoginDefault?: boolean;
   manualLoginProfileDir?: string;
+  cookieSyncDefault?: boolean;
 }
 
 interface RemoteServerDeps {
@@ -272,14 +274,23 @@ export async function createRemoteServer(
       // open before the service forces `keepBrowser` for process lifetime.
       const clientRequestedKeepBrowser = payload.browserConfig?.keepBrowser === true;
 
-      // Remote runs always rely on the host's own Chrome profile; ignore any inline cookie transfer.
-      if (payload.browserConfig) {
-        payload.browserConfig.inlineCookies = null;
-        payload.browserConfig.inlineCookiesSource = null;
-        payload.browserConfig.cookieSync = true;
-      } else {
-        payload.browserConfig = {} as typeof payload.browserConfig;
-      }
+      // A client may describe the conversation it wants; it may not describe this
+      // machine. Rebuilding the config from an allowlist rather than deleting
+      // known-bad keys makes that the default: a field added to
+      // BrowserSessionConfig later is host-owned until someone decides otherwise,
+      // instead of reaching Chrome the moment it exists.
+      //
+      // The distinction is not stylistic. `chromePath` names an executable this
+      // process spawns, `remoteChrome` names a debugger to attach to,
+      // `copyProfileSource` names a directory to copy credentials out of, and
+      // `browserTabRef`/`attachRunning` select a tab that may belong to somebody
+      // else's run. With those reachable, a bridge token is not a permission to
+      // ask ChatGPT a question — it is a permission to run code here.
+      payload.browserConfig = pickClientBrowserConfig(payload.browserConfig);
+      // Remote runs rely on the host's authentication policy; never accept cookie payloads from clients.
+      payload.browserConfig.inlineCookies = null;
+      payload.browserConfig.inlineCookiesSource = null;
+      payload.browserConfig.cookieSync = options.cookieSyncDefault === true;
 
       // Enforce manual-login profile when cookie sync is unavailable (e.g., Windows/WSL).
       if (options.manualLoginDefault) {
@@ -384,7 +395,11 @@ export async function createRemoteServer(
 export async function serveRemote(options: RemoteServerOptions = {}): Promise<void> {
   const manualProfileDir =
     options.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile");
-  const preferManualLogin = options.manualLoginDefault || process.platform === "win32" || isWsl();
+  const preferManualLogin =
+    options.manualLoginDefault ||
+    options.cookieSyncDefault !== true ||
+    process.platform === "win32" ||
+    isWsl();
   let cookies: CookieParam[] | null = null;
   let opened = false;
 
@@ -402,6 +417,9 @@ export async function serveRemote(options: RemoteServerOptions = {}): Promise<vo
   }
 
   if (!preferManualLogin) {
+    console.log(
+      "Warning: Chrome cookie copying can invalidate an active ChatGPT session when tokens rotate. Prefer the default dedicated manual-login profile when possible.",
+    );
     // Warm-up: ensure this host has a ChatGPT login before accepting runs.
     const result = await loadLocalChatgptCookies(console.log, CHATGPT_URL);
     cookies = result.cookies;
@@ -710,6 +728,49 @@ async function readRequestBody(req: http.IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+/**
+ * Fields a remote caller may set: they describe the conversation and its time
+ * budgets. Everything else on BrowserSessionConfig — executable paths, profile
+ * directories, debugger endpoints, tab selection, window mode, cookie policy,
+ * and the shared-profile concurrency limits — is the host's to decide.
+ */
+const CLIENT_BROWSER_CONFIG_FIELDS = [
+  "chatgptUrl",
+  "url",
+  "desiredModel",
+  "modelStrategy",
+  "thinkingTime",
+  "researchMode",
+  "archiveConversations",
+  "resumeConversationUrl",
+  "timeoutMs",
+  "inputTimeoutMs",
+  "attachmentTimeoutMs",
+  "assistantRecheckDelayMs",
+  "assistantRecheckTimeoutMs",
+  "autoReattachDelayMs",
+  "autoReattachIntervalMs",
+  "autoReattachTimeoutMs",
+  "keepBrowser",
+  "debug",
+] as const satisfies readonly (keyof BrowserSessionConfig)[];
+
+export function pickClientBrowserConfig(
+  requested: BrowserSessionConfig | undefined | null,
+): BrowserSessionConfig {
+  const accepted: BrowserSessionConfig = {};
+  if (!requested) {
+    return accepted;
+  }
+  for (const field of CLIENT_BROWSER_CONFIG_FIELDS) {
+    const value = requested[field];
+    if (value !== undefined) {
+      (accepted as Record<string, unknown>)[field] = value;
+    }
+  }
+  return accepted;
+}
+
 function sanitizeName(raw: string): string {
   return raw.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
@@ -739,7 +800,34 @@ function formatSocket(req: http.IncomingMessage): string {
   return `${host}:${port}`;
 }
 
+/**
+ * Addresses a client could actually reach this service on.
+ *
+ * A loopback bind is reachable only from this machine, so listing the host's LAN
+ * and tailnet addresses there is not merely noisy — it tells an operator the
+ * service is exposed when it is not, which is the wrong direction for a mistake
+ * about a token that grants browser automation.
+ */
 function formatReachableAddresses(bindAddress: string, port: number): string[] {
+  if (isLoopbackAddress(bindAddress)) {
+    return [`${formatHostPort(bindAddress, port)}`];
+  }
+  return formatAllInterfaceAddresses(bindAddress, port);
+}
+
+function isLoopbackAddress(address: string): boolean {
+  const normalized = address
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "");
+  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost";
+}
+
+function formatHostPort(address: string, port: number): string {
+  return address.includes(":") ? `[${address}]:${port}` : `${address}:${port}`;
+}
+
+function formatAllInterfaceAddresses(bindAddress: string, port: number): string[] {
   const ipv4: string[] = [];
   const ipv6: string[] = [];
   if (bindAddress && bindAddress !== "::" && bindAddress !== "0.0.0.0") {

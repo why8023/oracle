@@ -140,7 +140,7 @@ Oracle keeps a stable CLI-facing model set, but some names are aliases for the c
 Notes:
 
 - `gpt-5.1-pro` and `gpt-5.2-pro` are **CLI aliases** for “the current Pro API model” — OpenAI’s API uses `gpt-5.5-pro`.
-- If you want the classic Pro tier explicitly, use `gpt-5-pro`.
+- For API runs, use `gpt-5-pro` when you want the classic Pro tier explicitly. Browser-mode generic Pro aliases follow ChatGPT's current Pro target; use `gpt-5.5-pro` there to pin GPT-5.5.
 
 ### Browser engine vs API base URLs
 
