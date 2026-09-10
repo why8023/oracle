@@ -149,6 +149,64 @@ try {
       await evaluate('document.querySelector("#chips").innerText.includes("case418.jpg")'),
       false,
     );
+    await evaluate(`(() => {
+      const progress = document.createElement('div'); progress.id = 'upload-progress';
+      progress.dataset.state = 'uploading'; progress.textContent = 'Uploading 50%';
+      const editor = document.createElement('div'); editor.contentEditable = 'true';
+      const widget = document.createElement('div'); widget.contentEditable = 'false';
+      widget.append(progress); editor.append(widget); document.querySelector('form').append(editor);
+    })()`);
+    await assert.rejects(
+      waitForAttachmentCompletion(Runtime, 4500, names, logger),
+      /did not finish uploading/,
+    );
+    assert.equal(await evaluate(buildAttachmentReadyExpressionForTest(names)), false);
+    await assert.rejects(
+      submitPrompt(
+        {
+          runtime: Runtime,
+          input: Input,
+          page: Page,
+          attachmentNames: names,
+          attachmentNavigationUrl: await evaluate("location.href"),
+          attachmentTimeoutMs: 1000,
+          baselineTurns: 0,
+        },
+        "Do not send while a file is still uploading.",
+        logger,
+      ),
+      /Attachments never reached the exact ready send button/,
+    );
+    assert.equal(await evaluate("window.proof.clicks + window.proof.enters"), 0);
+    await evaluate('document.querySelector("#upload-progress").style.opacity = "0"');
+    assert.equal(await evaluate(buildAttachmentReadyExpressionForTest(names)), true);
+    await evaluate('document.querySelector("#upload-progress").style.opacity = "1"');
+    assert.equal(await evaluate(buildAttachmentReadyExpressionForTest(names)), false);
+    await evaluate(`(() => {
+      document.querySelector('#upload-progress').remove();
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.id = 'upload-progress'; svg.setAttribute('role', 'progressbar');
+      svg.setAttribute('aria-valuenow', '50'); svg.setAttribute('width', '20'); svg.setAttribute('height', '20');
+      document.querySelector('form').append(svg);
+    })()`);
+    assert.equal(await evaluate(buildAttachmentReadyExpressionForTest(names)), false);
+    await evaluate(
+      'document.querySelector("#upload-progress").setAttribute("aria-valuenow", "100")',
+    );
+    assert.equal(await evaluate(buildAttachmentReadyExpressionForTest(names)), true);
+    await evaluate(`(() => {
+      document.querySelector('#upload-progress').remove();
+      const progress = document.createElement('progress'); progress.id = 'upload-progress';
+      progress.value = 50; progress.max = 100; document.querySelector('form').append(progress);
+    })()`);
+    assert.equal(await evaluate(buildAttachmentReadyExpressionForTest(names)), false);
+    await evaluate('document.querySelector("#upload-progress").value = 100');
+    assert.equal(await evaluate(buildAttachmentReadyExpressionForTest(names)), true);
+    await evaluate(`(() => {
+      document.querySelector('#upload-progress').remove();
+      const unrelated = document.createElement('div'); unrelated.dataset.state = 'uploading';
+      unrelated.textContent = 'Uploading another conversation'; document.querySelector('aside').append(unrelated);
+    })()`);
     await waitForAttachmentCompletion(Runtime, 4000, names, logger);
     assert.equal(await evaluate(buildAttachmentReadyExpressionForTest(names)), true);
     const bytes = await evaluate(
@@ -190,9 +248,17 @@ try {
     };
     const prompt =
       "Read the three attached public synthetic fixtures. Return each test-token-not-real marker.";
+    const attachmentNavigationUrl = await evaluate("location.href");
     const started = Date.now();
     const turns = await submitPrompt(
-      { runtime, input, page, attachmentNames: names, baselineTurns: 0 },
+      {
+        runtime,
+        input,
+        page,
+        attachmentNames: names,
+        attachmentNavigationUrl,
+        baselineTurns: 0,
+      },
       prompt,
       logger,
     );
@@ -213,21 +279,22 @@ try {
     assert.equal(state.commits, 1);
     assert.equal(state.scrolls, 0);
     assert.deepEqual(state.trusted, [true]);
-    assert.deepEqual(events, [
-      "activate",
-      "measure",
-      "measure",
-      "mouseMoved",
-      "mousePressed",
-      "mouseReleased",
-    ]);
+    assert.deepEqual(events, ["activate", "key:keyDown", "key:keyUp"]);
     assert.deepEqual(await evaluate(buildAttachmentEvidenceExpression(names)), [
       false,
       false,
       false,
     ]);
     console.log(
-      JSON.stringify({ mode, filenameLessImage: true, elapsedMs, events, payloads, ...state }),
+      JSON.stringify({
+        mode,
+        uploadProgressBlocksSend: true,
+        filenameLessImage: true,
+        elapsedMs,
+        events,
+        payloads,
+        ...state,
+      }),
     );
   }
   await reset(true);
