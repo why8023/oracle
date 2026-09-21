@@ -11,7 +11,8 @@ import chalk from "chalk";
 import type { BrowserAttachment, BrowserLogger, CookieParam } from "../browser/types.js";
 import { materializeStagedFallbackBundle } from "../browser/prompt.js";
 import type { BrowserSessionConfig } from "../sessionManager.js";
-import { runBrowserMode } from "../browserMode.js";
+import type { runBrowserMode } from "../browserMode.js";
+import { resolveBrowserExecutor } from "../browser/executor.js";
 import { resolveBrowserConfig } from "../browser/config.js";
 import { RunSlots } from "./runSlots.js";
 export { RunSlots } from "./runSlots.js";
@@ -24,11 +25,12 @@ import type {
   RemoteRunPayload,
   RemoteRunEvent,
 } from "./types.js";
-import { MAX_REMOTE_ARTIFACT_BYTES } from "./types.js";
+import { MAX_REMOTE_ARTIFACT_BYTES, pickRemoteImageMetadata } from "./types.js";
 import { getCookies, type Cookie } from "@steipete/sweet-cookie";
 import { CHATGPT_URL } from "../browser/constants.js";
 import { getCliVersion } from "../version.js";
 import { getOracleHomeDir } from "../oracleHome.js";
+import { resolveBrowserProvider, resolveRemoteBrowserModel } from "../browser/provider.js";
 import {
   cleanupStaleProfileState,
   readDevToolsPort,
@@ -39,6 +41,7 @@ import {
 import { normalizeChatgptUrl } from "../browser/utils.js";
 import {
   computeFileSha256,
+  resolveSessionArtifactsDir,
   sanitizeArtifactFilename,
   sanitizeArtifactMimeType,
   validateArtifactFile,
@@ -89,6 +92,7 @@ const ARTIFACT_CAPABILITIES: RemoteArtifactCapabilities = {
   runCancellation: true,
   deferredFallbackBundling: true,
   artifactTransfer: true,
+  generatedImages: true,
   artifactProtocolVersion: ARTIFACT_PROTOCOL_VERSION,
   maxArtifactBytes: MAX_REMOTE_ARTIFACT_BYTES,
 };
@@ -128,7 +132,6 @@ export async function createRemoteServer(
   options: RemoteServerOptions = {},
   deps: RemoteServerDeps = {},
 ): Promise<RemoteServerInstance> {
-  const runBrowser = deps.runBrowser ?? runBrowserMode;
   const attachedBrowser = usesHostBrowserAttachment(options.browserConfig);
   const manualLoginDefault = !attachedBrowser && options.manualLoginDefault;
   const hostBrowserConfig: RemoteHostBrowserConfig = options.browserConfig
@@ -315,6 +318,27 @@ export async function createRemoteServer(
       await abandon();
       return;
     }
+    let model: string | undefined;
+    try {
+      model = resolveRemoteBrowserModel(payload.options.model, payload.browserConfig?.desiredModel);
+      if (resolveBrowserProvider(model) === "gemini" && payload.options.imageOutputRequested) {
+        throw new Error(
+          "Remote Gemini image generation and editing are not supported; run these requests locally.",
+        );
+      }
+    } catch (error) {
+      await abandon();
+      if (!res.destroyed) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: "unsupported_browser_provider",
+            message: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
+      return;
+    }
     if (!admissionEnabled) {
       signal = payload.options.cancelOnDisconnect === true ? controller.signal : undefined;
       reserve();
@@ -442,6 +466,10 @@ export async function createRemoteServer(
           ? payload.options.sessionId.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 32)
           : "remote";
       payload.options.sessionId = `${clientSession || "remote"}-${runId}`;
+      const hostImageOutputPath =
+        payload.options.imageOutputRequested === true
+          ? path.join(resolveSessionArtifactsDir(payload.options.sessionId), "generated.png")
+          : undefined;
       if (browserTabCap !== undefined) payload.browserConfig.maxConcurrentTabs = browserTabCap;
       signal?.throwIfAborted();
 
@@ -457,8 +485,18 @@ export async function createRemoteServer(
         }
       }
 
+      const runBrowser =
+        deps.runBrowser ??
+        (await resolveBrowserExecutor({
+          model: model ?? "gpt-5.5",
+          youtube:
+            typeof payload.options.youtube === "string" ? payload.options.youtube : undefined,
+          geminiShowThoughts: payload.options.geminiShowThoughts === true,
+          geminiAllowModelFallback: payload.options.geminiAllowModelFallback !== false,
+        }));
       const result = await runBrowser({
         prompt: payload.prompt,
+        model,
         attachments,
         fallbackSubmission,
         config: payload.browserConfig,
@@ -473,6 +511,7 @@ export async function createRemoteServer(
         heartbeatIntervalMs: payload.options.heartbeatIntervalMs,
         verbose: payload.options.verbose,
         sessionId: payload.options.sessionId,
+        generateImagePath: hostImageOutputPath,
         followUpPrompts: payload.options.followUpPrompts,
       });
 
@@ -788,13 +827,16 @@ async function registerRemoteArtifacts(params: {
 }): Promise<{ descriptors: RemoteArtifactDescriptor[]; warnings: BrowserRunWarning[] }> {
   pruneExpiredArtifacts(params.artifactRegistry);
   const seen = new Set<string>();
-  const fileArtifacts: SessionArtifact[] = [
+  const transferableArtifacts: SessionArtifact[] = [
     ...(params.result.savedFiles ?? []),
-    ...(params.result.artifacts ?? []).filter((artifact) => artifact.kind === "file"),
+    ...(params.result.savedImages ?? []),
+    ...(params.result.artifacts ?? []).filter(
+      (artifact) => artifact.kind === "file" || artifact.kind === "image",
+    ),
   ];
   const descriptors: RemoteArtifactDescriptor[] = [];
   const warnings: BrowserRunWarning[] = [];
-  for (const artifact of fileArtifacts) {
+  for (const artifact of transferableArtifacts) {
     if (!artifact?.path || seen.has(artifact.path)) {
       continue;
     }
@@ -806,7 +848,10 @@ async function registerRemoteArtifacts(params: {
           `[serve] Skipping remote artifact descriptor: ${error instanceof Error ? error.message : String(error)}`,
         );
         warnings.push({
-          code: "remote-artifact-registration-failed",
+          code:
+            artifact.kind === "image"
+              ? "remote-image-registration-failed"
+              : "remote-artifact-registration-failed",
           severity: "warning",
           message:
             `Oracle captured the browser text response, but the bridge host could not prepare ${filename} for transfer. ` +
@@ -860,7 +905,14 @@ async function buildRemoteArtifactRegistration(
     descriptor: {
       artifactId: randomUUID(),
       runId,
-      kind: "file",
+      kind: artifact.kind === "image" ? "image" : "file",
+      ...(artifact.kind === "image"
+        ? {
+            image: pickRemoteImageMetadata(
+              artifact as import("../browser/types.js").SavedBrowserImage,
+            ),
+          }
+        : {}),
       filename,
       mimeType,
       byteSize: fileStat.size,
@@ -930,6 +982,7 @@ const CLIENT_BROWSER_CONFIG_FIELDS = [
   "chatgptUrl",
   "url",
   "desiredModel",
+  "modelIsImplicitDefault",
   "modelStrategy",
   "thinkingTime",
   "researchMode",
@@ -1007,15 +1060,43 @@ function sanitizeResult(
   result: BrowserRunResult,
   warnings: BrowserRunWarning[] = [],
 ): BrowserRunResult {
+  const hostArtifactPaths = [
+    ...(result.savedFiles ?? []),
+    ...(result.savedImages ?? []),
+    ...(result.artifacts ?? []),
+  ]
+    .map((artifact) => artifact.path)
+    .filter((artifactPath): artifactPath is string => Boolean(artifactPath));
+  const savedImagePaths = [
+    ...(result.savedImages ?? []),
+    ...(result.artifacts ?? []).filter((artifact) => artifact.kind === "image"),
+  ].map((artifact) => artifact.path);
+  const imageCount = new Set(savedImagePaths).size;
+  const sanitizeAnswer = (value: string | undefined): string | undefined => {
+    let sanitized = value;
+    // Local save notices describe the host filesystem, not the client's transferred files.
+    for (const imagePath of savedImagePaths) {
+      sanitized = sanitized
+        ?.split(` Saved to: ${imagePath}`)
+        .join("")
+        .split(` Saved ${imageCount} file(s) starting at: ${imagePath}`)
+        .join("");
+    }
+    for (const artifactPath of hostArtifactPaths) {
+      sanitized = sanitized?.split(artifactPath).join(path.basename(artifactPath));
+    }
+    return sanitized;
+  };
   return {
-    answerText: result.answerText,
-    answerMarkdown: result.answerMarkdown,
-    answerHtml: result.answerHtml,
+    answerText: sanitizeAnswer(result.answerText) ?? "",
+    answerMarkdown: sanitizeAnswer(result.answerMarkdown) ?? "",
+    answerHtml: sanitizeAnswer(result.answerHtml),
     tookMs: result.tookMs,
     answerTokens: result.answerTokens,
     answerChars: result.answerChars,
     modelSelection: result.modelSelection,
     thinkingSelection: result.thinkingSelection,
+    providerNativeCapture: result.providerNativeCapture,
     researchPlan: result.researchPlan,
     archive: result.archive,
     tabUrl: result.tabUrl,

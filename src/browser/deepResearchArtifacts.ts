@@ -18,6 +18,7 @@ export async function saveDeepResearchRunArtifacts(params: {
   prompt: string;
   result: DeepResearchCompletionResult;
   conversationUrl?: string;
+  providerArtifacts?: SessionArtifact[];
   logger: BrowserLogger;
 }): Promise<SessionArtifact[] | undefined> {
   const reportArtifact = await saveOptionalDeepResearchArtifact(
@@ -37,7 +38,7 @@ export async function saveDeepResearchRunArtifacts(params: {
     logger: params.logger,
   });
   const researchArtifacts = appendArtifacts(
-    appendArtifacts(undefined, [reportArtifact]),
+    appendArtifacts(params.providerArtifacts, [reportArtifact]),
     comparisonArtifacts ?? [],
   );
   const transcriptArtifact = await saveOptionalDeepResearchArtifact(

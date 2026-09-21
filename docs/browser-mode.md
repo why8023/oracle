@@ -43,6 +43,13 @@ oracle --engine browser \
 
 You can pass the same payload inline (`--browser-inline-cookies '<json or base64>'`) or via env (`ORACLE_BROWSER_COOKIES_JSON`, `ORACLE_BROWSER_COOKIES_FILE`). Cloudflare cookies (`cf_clearance`, `__cf_bm`, etc.) are only needed when you hit a challenge.
 
+When no model is supplied on the command line or in configuration, Oracle keeps
+its existing browser default. If the visible ChatGPT selection is a newer model,
+Oracle prints a model-selection warning before switching and submitting the
+prompt. Pass `--model` to choose explicitly, or `--browser-model-strategy current`
+to retain ChatGPT's selection. Explicit models, saved model preferences, and
+`current`/`ignore` strategies do not produce this warning.
+
 ## Quick example: attach to your running Chrome
 
 Use this when you already have a signed-in Chrome session running with DevTools access enabled and want Oracle to reuse that browser instead of launching its own copy.
@@ -68,7 +75,7 @@ Notes:
     -p "Summarize the last assistant response in one paragraph"
   ```
 - Oracle first reads local `DevToolsActivePort` metadata. If no matching metadata exists, it probes the selected local endpoint's `/json/version` (including IPv6) for the browser websocket. Each of two attempts has a one-second deadline covering headers and the complete response body, with a 500 ms pause before retrying. It then reuses the normal CDP automation flow without taking ownership of the browser profile.
-- Chrome 144+ can show an **Allow remote debugging?** prompt for **each browser connection**, including reconnects and session reattach (which lists tabs and then attaches with separate connections). Approval for one connection does not approve the next. Keep **at least one Chrome window open**: a background-only Chrome started with `--no-startup-window` cannot display the approval sheet.
+- Chrome 144+ can show an **Allow remote debugging?** prompt for each browser WebSocket. Oracle shares one connection to the same browser endpoint for its process lifetime, including target discovery, page sessions, and successive `oracle serve` requests. Completing or cancelling a request detaches its page session while retaining the connection. An actual browser disconnect permits a new connection. Separate CLI processes still need separate approval; use one long-running `oracle serve` host to share approval across client commands. Keep **at least one Chrome window open** so Chrome can display the approval sheet.
 - Oracle waits 20 seconds per approval by default. Use `--browser-approval-wait 5m` to allow five minutes, `ORACLE_BROWSER_APPROVAL_WAIT=5m`, or `browser.approvalWaitMs: 300000` in configuration. Durations accept milliseconds or `ms`/`s`/`m`/`h` units; they must be positive. CLI flags override the environment, which overrides saved CLI configuration. Session reattach uses the saved wait (or the environment/default for older sessions). The service host controls its own approval wait. Oracle logs when each connection starts waiting and every 15 seconds until it connects or fails; click Allow for each prompt. It keeps a pending connection open rather than issuing parallel approval requests.
 - Attach mode always opens a fresh Oracle-owned tab and closes only that tab after a successful run.
 - Cookie sync, Chrome launch flags, and profile lifecycle flags are skipped because the browser is already running.
@@ -123,6 +130,7 @@ Notes:
 - `ORACLE_CHATGPT_ACCOUNT_EMAIL`: exact saved-account email to select if ChatGPT shows its “Welcome back” account picker. Set it on the machine running browser automation. Oracle never logs the address; without it, Oracle selects only a single unambiguous saved account and fails closed when several are present.
 - `--browser-cookie-sync` explicitly copies cookies from live Chrome into the temporary automation profile. Prefer `--browser-manual-login` (persistent automation profile + user-driven login), inline cookies, or attach-running mode; copied ChatGPT session tokens may rotate in the automation browser and invalidate the live Chrome session. `--browser-no-cookie-sync` remains as a compatibility override for configurations that enabled copying.
 - `--browser-headless`, `--browser-hide-window`, `--browser-keep-browser`, and the global `-v/--verbose` flag control the launcher and diagnostics. On macOS, Oracle records a locally launched window before positioning it off-screen, then restores that recorded placement on a later visible run. Windows without Oracle's saved marker—including valid negative-coordinate placements on another display—remain untouched; attach-running and remote Chrome windows are never repositioned by this policy.
+- Verbose browser diagnostics replace inline cookie payloads with a cookie count, including the saved session log.
 - `--copy-profile <dir>`: copy a signed-in Chrome user-data directory (e.g. `"$HOME/Library/Application Support/Google/Chrome"`) to a throwaway profile and run against it, reusing your live ChatGPT session with no manual sign-in. Oracle copies the profile recorded as active in `Local State`; pass `--browser-chrome-profile <name>` to select another direct child profile. The copy is launched with the real Keychain (not mocked) so its encrypted cookies decrypt, and is always deleted afterward—including setup/launch failures, incomplete captures, Cloudflare challenges, and interrupts. Copied-profile runs cannot be kept or reattached. Not compatible with `--browser-keep-browser`, `--browser-manual-login`, `--browser-attach-running`, `--remote-chrome`, or `--remote-host`, and fails fast if the required `Local State` cannot be copied. macOS/Linux; requires `rsync`.
 - `--browser-url`: override ChatGPT base URL if needed.
 - `--browser-attachments <auto|never|always>`: control how `--file` inputs are delivered in browser mode. Default `auto` pastes text contents inline up to ~60k characters and uploads larger or raw files. `never` requires inline-compatible text inputs and rejects raw/binary files.
@@ -384,7 +392,7 @@ Prefer to keep Chrome entirely on the remote Mac (no DevTools tunneling, no manu
    ```
 
    Use `--host`, `--port`, or `--token` to override the defaults if needed.
-   On first use, sign in to ChatGPT in the dedicated automation Chrome window. The service keeps that profile for later runs.
+   On first use, sign in to ChatGPT or Gemini in the dedicated automation Chrome window, according to the models you use. The service keeps that profile for later runs.
 
 2. **Run from your laptop**
 
@@ -397,6 +405,7 @@ Prefer to keep Chrome entirely on the remote Mac (no DevTools tunneling, no manu
    ```
 
    - `--remote-host` points the CLI at the VM.
+   - `--model gemini-3.5-flash` (or another supported Gemini browser model) selects the Gemini web executor on the host. Upgrade both endpoints for remote Gemini; see [Gemini](gemini.md) for supported options. GPT models keep the ChatGPT browser path.
    - `--remote-token` matches the token printed by `oracle serve` (set `ORACLE_REMOTE_TOKEN` to avoid repeating it).
    - You can also set defaults in `~/.oracle/config.json` (`browser.remoteHost`, `browser.remoteToken`) so you don’t need the flags; env vars still override those when present.
    - Cookies are **not** transferred from your laptop. The service reuses the dedicated automation profile on the host.
@@ -450,3 +459,45 @@ Restart all browser controllers together after upgrading: older live controllers
 used a different lock-timeout recovery rule. Existing stored lease records remain
 readable. Native Windows shared-profile Chrome is detached from its launching
 controller; this does not change temporary or copied-profile launch policy.
+
+### Provider-native conversation evidence
+
+`--browser-capture-provider-native` additionally saves ChatGPT's full conversation
+JSON, verbatim, and an evidence JSON file in the session's `artifacts/` directory.
+It is off by default. Set `browser.captureProviderNative: true` in your user
+config to enable it; `--no-browser-capture-provider-native` overrides that preference.
+Project configs and remote bridge clients cannot enable this export. Direct
+remote-Chrome runs use the same capture path as local Chrome.
+
+The raw record may include prior turns, alternate branches, attachments, and
+provider metadata, beyond the current answer. Files use owner-only permissions
+on POSIX and follow normal session retention/cleanup. `--write-artifacts` can
+export them with other session artifacts; copies have their own retention.
+Treat the full raw record as conversation data when sharing it.
+
+Capture uses ChatGPT's undocumented conversation endpoint from the authenticated
+page and reuses Oracle's existing Chrome connection. Two independent fetches
+produce the raw record and in-page SHA-256 digests. The second body never crosses
+the browser boundary. Document hashes may differ because provider metadata
+changes; this alone is not an answer-fidelity failure.
+
+The evidence format is `oracle.provider-native-capture-evidence/v1`, with
+`text-fields-v1` normalization: string-only text parts and thought contents join
+with two newlines; code/execution output use `text`; reasoning recaps use
+`content`. Mixed multimodal and unknown content have null digests, while their
+original bytes remain in the raw record. This format does not claim compatibility
+with external Python JSON normalization.
+
+`browser.providerNativeCapture` in session metadata records `matched`, `divergent`,
+or `unknown`. A match requires the captured assistant's message ID on the active
+provider branch and exact UTF-8 text, optionally trimming Oracle's surrounding
+whitespace. User turns, earlier answers, and alternate branches cannot substitute
+for that message. Deep Research reports without an assistant message ID, unsupported
+content, missing IDs, and failed evidence fetches report `unknown`.
+
+The existing copy-button/DOM answer is still returned. Capture is optional evidence
+and never fails the answer: temporary chats, bot challenges, invalid responses,
+disconnects, and write failures record a typed reason. Fetching/draining has a
+30-second total budget and an 8 MiB limit per document. Tokens stay in the page;
+logs and failure summaries contain fixed reasons rather than response bodies or
+exception details. The raw artifact is unchanged provider data, not a redacted transcript.

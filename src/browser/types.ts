@@ -1,3 +1,4 @@
+import type { ProviderNativeCaptureSummary } from "./chatgptConversation.js";
 import type CDP from "chrome-remote-interface";
 import type Protocol from "devtools-protocol";
 import type {
@@ -112,6 +113,7 @@ export interface BrowserAutomationConfig {
   keepBrowser?: boolean;
   hideWindow?: boolean;
   desiredModel?: string | null;
+  modelIsImplicitDefault?: boolean;
   modelStrategy?: BrowserModelStrategy;
   debug?: boolean;
   allowCookieErrors?: boolean;
@@ -131,10 +133,14 @@ export interface BrowserAutomationConfig {
   archiveConversations?: BrowserArchiveMode;
   /** Existing ChatGPT conversation URL to open before submitting the prompt. */
   resumeConversationUrl?: string | null;
+  /** Capture ChatGPT's own conversation document plus independent per-turn digests. */
+  captureProviderNative?: boolean;
 }
 
 export interface BrowserRunOptions {
   prompt: string;
+  /** Canonical model key, separate from a provider-specific picker label. */
+  model?: string;
   /**
    * Abort the run when the caller no longer wants it.
    *
@@ -207,6 +213,7 @@ export interface BrowserRunResult {
   archive?: BrowserArchiveResult;
   modelSelection?: BrowserModelSelectionEvidence;
   thinkingSelection?: BrowserThinkingSelectionEvidence;
+  providerNativeCapture?: ProviderNativeCaptureSummary;
   warnings?: BrowserRunWarning[];
   tookMs: number;
   answerTokens: number;
@@ -235,6 +242,7 @@ export type ResolvedBrowserConfig = Required<
     | "chromePath"
     | "chromeCookiePath"
     | "desiredModel"
+    | "modelIsImplicitDefault"
     | "remoteChrome"
     | "remoteChromeBrowserWSEndpoint"
     | "remoteChromeProfileRoot"
@@ -251,6 +259,7 @@ export type ResolvedBrowserConfig = Required<
   attachRunning?: boolean;
   browserTabRef?: string | null;
   desiredModel?: string | null;
+  modelIsImplicitDefault?: boolean;
   modelStrategy?: BrowserModelStrategy;
   thinkingTime?: ThinkingTimeLevel;
   debugPort?: number | null;

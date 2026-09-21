@@ -14,6 +14,10 @@ import {
   __test__,
 } from "../../src/browser/artifacts.js";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
+import {
+  hasSavedDeepResearchRunArtifacts,
+  saveDeepResearchRunArtifacts,
+} from "../../src/browser/deepResearchArtifacts.js";
 
 describe("browser session artifacts", () => {
   afterEach(() => {
@@ -53,6 +57,39 @@ describe("browser session artifacts", () => {
         reportMarkdown: "Called tool",
       }),
     ).resolves.toBeNull();
+  });
+
+  test("preserves provider evidence alongside Deep Research reports and transcripts", async () => {
+    const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-research-evidence-"));
+    setOracleHomeDirOverrideForTest(tmpHome);
+    try {
+      const provider = await writeBinaryBrowserArtifact({
+        sessionId: "research-evidence",
+        kind: "file",
+        filename: "provider-conversation.json",
+        contents: Buffer.from('{"id":"abc"}'),
+        label: "Provider conversation",
+        mimeType: "application/json",
+      });
+      const artifacts = await saveDeepResearchRunArtifacts({
+        sessionId: "research-evidence",
+        prompt: "Summarize the evidence.",
+        result: {
+          text: "This completed research report preserves both the downloaded report and provider evidence.\nhttps://example.com/source",
+          meta: {},
+        },
+        providerArtifacts: [provider!],
+        logger: () => {},
+      });
+      expect(hasSavedDeepResearchRunArtifacts(artifacts)).toBe(true);
+      expect(artifacts).toContainEqual(provider);
+      const transcript = artifacts!.find((artifact) => artifact.kind === "transcript")!;
+      const text = await fs.readFile(transcript.path, "utf8");
+      expect(text).toContain("provider-conversation.json");
+      expect(text).toContain("deep-research-report.md");
+    } finally {
+      await fs.rm(tmpHome, { recursive: true, force: true });
+    }
   });
 
   test("does not save Deep Research planning panels as reports", async () => {

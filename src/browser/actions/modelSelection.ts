@@ -37,15 +37,35 @@ export async function ensureModelSelection(
   desiredModel: string,
   logger: BrowserLogger,
   strategy: BrowserModelStrategy = "select",
-  options: { buttonWaitMs?: number; buttonPollMs?: number } = {},
+  options: { buttonWaitMs?: number; buttonPollMs?: number; implicitDefault?: boolean } = {},
 ): Promise<BrowserModelSelectionEvidence> {
   const buttonWaitMs = options.buttonWaitMs ?? MODEL_BUTTON_WAIT_MS;
   const buttonPollMs = options.buttonPollMs ?? MODEL_BUTTON_POLL_MS;
-  const deadline = Date.now() + Math.max(0, buttonWaitMs);
+  const probeDeadline = Date.now() + Math.max(0, buttonWaitMs);
+  let deadline: number | undefined;
 
   let result: ModelSelectionResult;
   let announcedWait = false;
   for (;;) {
+    if (options.implicitDefault && strategy === "select") {
+      // Wait for observable selection before a default-driven switch, just as selection waits for the picker.
+      const observed = await Runtime.evaluate({
+        expression: buildModelSelectionExpression(desiredModel, "current"),
+        awaitPromise: true,
+        returnByValue: true,
+      }).catch(() => null);
+      const label = (observed?.result?.value as { label?: unknown } | undefined)?.label;
+      if ((typeof label !== "string" || !label.trim()) && Date.now() < probeDeadline) {
+        await delay(buttonPollMs);
+        continue;
+      }
+      if (typeof label === "string" && isNewerModelLabel(label, desiredModel)) {
+        logger(
+          `[browser] Model selection warning: no model was specified, so Oracle's default will switch ChatGPT from "${label}" to "${desiredModel}" before submission. Pass --model explicitly or --browser-model-strategy current to keep the selected model.`,
+        );
+      }
+    }
+    deadline ??= Date.now() + Math.max(0, buttonWaitMs);
     const outcome = await Runtime.evaluate({
       expression: buildModelSelectionExpression(desiredModel, strategy),
       awaitPromise: true,
@@ -112,6 +132,18 @@ export async function ensureModelSelection(
   }
 }
 
+function isNewerModelLabel(current: string, target: string): boolean {
+  const latest = /^(?:Latest|最新|최신)$/i;
+  if (latest.test(current.trim())) return !latest.test(target.trim());
+  const version = (label: string): [number, number] | null => {
+    const match = label.match(/(?:^|gpt[- ]*|thinking\s+)(\d+)(?:\.(\d+))?/i);
+    return match ? [Number(match[1]), Number(match[2] ?? 0)] : null;
+  };
+  const from = version(current);
+  const to = version(target);
+  return Boolean(from && to && (from[0] > to[0] || (from[0] === to[0] && from[1] > to[1])));
+}
+
 function assertResolvedModelSelection(desiredModel: string, resolvedLabel: string): void {
   const desired = desiredModel.toLowerCase();
   const resolved = resolvedLabel.toLowerCase();
@@ -122,7 +154,8 @@ function assertResolvedModelSelection(desiredModel: string, resolvedLabel: strin
     // evidence of GPT-6 Astra. Do not let a generic picker result verify Latest.
     if (
       resolvedLabel.normalize("NFC").trim() === "Latest" ||
-      resolvedLabel.normalize("NFC").trim() === "最新"
+      resolvedLabel.normalize("NFC").trim() === "最新" ||
+      resolvedLabel.normalize("NFC").trim() === "최신"
     ) {
       return;
     }
@@ -254,7 +287,7 @@ function buildModelSelectionExpression(
     // Sol or an arbitrary localized menu row can never satisfy a Latest request.
     const isLatestModelLabel = (value) => {
       const label = String(value ?? '').normalize('NFC').trim();
-      return label === 'Latest' || label === '最新';
+      return label === 'Latest' || label === '最新' || label === '최신';
     };
     const normalizedTokens = Array.from(new Set([normalizedTarget, ...LABEL_TOKENS]))
       .map((token) => normalizeText(token))
@@ -1525,8 +1558,9 @@ function buildModelMatchersLiteral(targetModel: string): {
     testIdTokens.add("gpt56");
   }
   if (base === "latest") {
-    // ChatGPT's Japanese advanced-model radio is named exactly "最新".
+    // Exact Japanese and Korean labels for the advanced-model Latest radio.
     push("最新", labelTokens);
+    push("최신", labelTokens);
   }
   // Numeric variations (5.5 <-> 55 <-> gpt-5-5)
   if (base.includes("5.5") || base.includes("5-5") || base.includes("55")) {

@@ -402,6 +402,11 @@ describe("runBrowserSessionExecution", () => {
           tookMs: 1000,
           answerTokens: 12,
           answerChars: 20,
+          providerNativeCapture: {
+            status: "unavailable" as const,
+            answerFidelity: "unknown" as const,
+            failure: { reason: "no-conversation-id" as const },
+          },
           modelSelection: {
             requestedModel: "GPT-5.5 Pro",
             resolvedLabel: "Pro",
@@ -415,6 +420,10 @@ describe("runBrowserSessionExecution", () => {
       },
     );
 
+    expect(result.providerNativeCapture).toMatchObject({
+      status: "unavailable",
+      failure: { reason: "no-conversation-id" },
+    });
     expect(result.modelSelection).toMatchObject({
       requestedModel: "GPT-5.5 Pro",
       resolvedLabel: "Pro",
@@ -1029,6 +1038,46 @@ describe("runBrowserSessionExecution", () => {
     ).rejects.toThrow(/browser exploded/i);
 
     await expect(fs.access(bundleDir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("redacts inline cookies from verbose logs without changing execution credentials", async () => {
+    const log = vi.fn();
+    const inlineCookies = [
+      { name: "synthetic-session", value: "synthetic-cookie-value", domain: ".chatgpt.com" },
+    ];
+    const executeBrowser = vi.fn(async () => ({
+      answerText: "text",
+      answerMarkdown: "markdown",
+      tookMs: 10,
+      answerTokens: 1,
+      answerChars: 5,
+    }));
+    await runBrowserSessionExecution(
+      {
+        runOptions: { ...baseRunOptions, verbose: true },
+        browserConfig: { inlineCookies },
+        cwd: "/repo",
+        log,
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 1,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser,
+      },
+    );
+    expect(log.mock.calls.flat().join("\n")).not.toContain("synthetic-cookie-value");
+    expect(executeBrowser).toHaveBeenCalledWith(
+      expect.objectContaining({ config: expect.objectContaining({ inlineCookies }) }),
+    );
   });
 
   test("respects verbose logging", async () => {

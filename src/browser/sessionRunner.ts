@@ -1,3 +1,4 @@
+import type { ProviderNativeCaptureSummary } from "./chatgptConversation.js";
 import chalk from "chalk";
 import type { RunOracleOptions } from "../oracle.js";
 import { formatTokenCount } from "../oracle/runUtils.js";
@@ -10,9 +11,10 @@ import type {
   BrowserRuntimeMetadata,
   SessionArtifact,
 } from "../sessionStore.js";
-import { runBrowserMode } from "../browserMode.js";
+import { resolveBrowserExecutor, type BrowserExecutor } from "./executor.js";
 import type { BrowserRunOptions, BrowserRunResult } from "../browserMode.js";
 import { DEFAULT_BROWSER_CONFIG } from "./config.js";
+import { redactBrowserConfigForDebugLog } from "./configLogging.js";
 import {
   assembleBrowserPrompt,
   cleanupGeneratedBrowserBundles,
@@ -44,6 +46,7 @@ export interface BrowserExecutionResult {
   archive?: BrowserArchiveResult;
   modelSelection?: BrowserModelSelectionEvidence;
   thinkingSelection?: BrowserThinkingSelectionEvidence;
+  providerNativeCapture?: ProviderNativeCaptureSummary;
   warnings?: BrowserRunWarning[];
   answerText: string;
   artifacts?: SessionArtifact[];
@@ -60,7 +63,7 @@ interface RunBrowserSessionArgs {
 
 export interface BrowserSessionRunnerDeps {
   assemblePrompt?: typeof assembleBrowserPrompt;
-  executeBrowser?: typeof runBrowserMode;
+  executeBrowser?: BrowserExecutor;
   persistRuntimeHint?: (
     runtime: BrowserRuntimeMetadata,
     modelSelection?: BrowserModelSelectionEvidence,
@@ -145,7 +148,6 @@ export async function runBrowserSessionExecution(
   deps: BrowserSessionRunnerDeps = {},
 ): Promise<BrowserExecutionResult> {
   const assemblePrompt = deps.assemblePrompt ?? assembleBrowserPrompt;
-  const executeBrowser = deps.executeBrowser ?? runBrowserMode;
   const persistRuntimeHint = deps.persistRuntimeHint ?? (() => {});
   const inputTimeoutMs = browserConfig.inputTimeoutMs ?? DEFAULT_BROWSER_CONFIG.inputTimeoutMs;
   let preparationAbandoned = false;
@@ -155,6 +157,7 @@ export async function runBrowserSessionExecution(
   if (signal?.aborted) {
     throw new BrowserRunCancelledError();
   }
+  const executeBrowser = deps.executeBrowser ?? (await resolveBrowserExecutor(runOptions));
   try {
     promptArtifacts = await Promise.race([
       assemblePrompt(runOptions, { cwd }).then(async (artifacts) => {
@@ -231,9 +234,11 @@ async function executeAssembledBrowserSession({
   if (runOptions.verbose) {
     log(
       chalk.dim(
-        `[verbose] Browser config: ${JSON.stringify({
-          ...browserConfig,
-        })}`,
+        `[verbose] Browser config: ${JSON.stringify(
+          redactBrowserConfigForDebugLog({
+            ...browserConfig,
+          }),
+        )}`,
       ),
     );
     log(chalk.dim(`[verbose] Browser prompt length: ${promptArtifacts.composerText.length} chars`));
@@ -310,6 +315,7 @@ async function executeAssembledBrowserSession({
   try {
     browserResult = await executeBrowser({
       prompt: promptArtifacts.composerText,
+      model: runOptions.model,
       attachments: promptArtifacts.attachments,
       fallbackSubmission,
       config: executionBrowserConfig,
@@ -433,6 +439,7 @@ async function executeAssembledBrowserSession({
     archive: browserResult.archive,
     modelSelection,
     thinkingSelection,
+    providerNativeCapture: browserResult.providerNativeCapture,
     warnings,
     answerText,
     artifacts: savedArtifacts,

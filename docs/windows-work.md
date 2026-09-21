@@ -17,6 +17,8 @@ Future Windows gotchas belong here. Update this doc when you learn something new
 
 - Tab-lease tests run real PowerShell process-identity probes (up to five seconds each). Their Windows test budget must cover multiple probes and registry cleanup. Failed self-identity probes are retried on the next lookup; only a successful identity is cached for the controller lifetime.
 
+- Detached-worker proofs must wait for the worker PID to exit before deleting its temporary working directory. Sending SIGTERM alone races Windows handle release and can fail cleanup with EBUSY; use a bounded exit wait and bounded filesystem retries without skipping the lifecycle assertions.
+
 - A fresh Windows worktree with `core.autocrlf=true` can make `oxfmt --check` flag otherwise unchanged files. Use LF checkout contents for validation and inspect the staged diff to keep checkout-only line-ending changes out of the PR.
 
 - ChatGPT sidebar/history labels can include phrases like "Login setup instruction"; login probes must match exact auth CTAs, not any visible text starting with login, or manual-login automation loops forever before typing.
@@ -33,3 +35,5 @@ Future Windows gotchas belong here. Update this doc when you learn something new
 
 - After merging a dependency update that changes oxfmt, CRLF checkouts may fail format checks across otherwise unchanged files. Normalize tracked text working copies to LF and use `git -c core.autocrlf=false` for staging; verify the resulting diff contains only intended changes.
 - Synthetic attach-running proofs must isolate the child process's `LOCALAPPDATA` on Windows: browser discovery otherwise scans the real application-data tree before probing the fixture endpoint and can exhaust the proof's 20-second deadline.
+
+Provider-native conversation evidence uses the existing browser connection on Windows too. Files follow the account/directory ACLs; the POSIX owner-only file mode assertion is skipped on Windows. Capture failures leave the normal answer available.

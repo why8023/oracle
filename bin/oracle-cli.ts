@@ -68,7 +68,7 @@ import { formatRenderedMarkdown } from "../src/cli/renderOutput.js";
 import { resolveRenderFlag, resolveRenderPlain } from "../src/cli/renderFlags.js";
 import { resolveGeminiModelId } from "../src/oracle/geminiModels.js";
 import type { StatusOptions } from "../src/cli/sessionCommand.js";
-import { isErrorLogged } from "../src/cli/errorUtils.js";
+import { formatCliError, isErrorLogged } from "../src/cli/errorUtils.js";
 import { resolveOutputPath } from "../src/cli/writeOutputPath.js";
 import { getCliVersion } from "../src/version.js";
 import {
@@ -160,6 +160,7 @@ interface CliOptions extends OptionValues {
   browserManualLoginProfileDir?: string;
   copyProfile?: string;
   browserThinkingTime?: "light" | "standard" | "extended" | "extra-high" | "pro" | "heavy";
+  browserCaptureProviderNative?: boolean;
   browserResearch?: "off" | "search" | "deep";
   browserFollowUp?: string[];
   browserAllowCookieErrors?: boolean;
@@ -836,6 +837,11 @@ program
       "Browser research mode: search activates Web Search; deep activates Deep Research.",
     ).choices(["off", "search", "deep"]),
   )
+  .option(
+    "--browser-capture-provider-native",
+    "Save ChatGPT’s full conversation record and independent text digests as private session artifacts (opt-in; includes prior turns).",
+  )
+  .option("--no-browser-capture-provider-native", "Disable provider-native evidence capture.")
   .addOption(
     new Option(
       "--browser-archive <mode>",
@@ -1369,7 +1375,7 @@ program
   .option("--remote-host <host:port>", "Delegate browser runs to a remote `oracle serve` instance.")
   .option("--remote-token <token>", "Access token for the remote `oracle serve` instance.")
   .action(async (sessionId: string, _options: RestartCommandOptions, cmd: Command) => {
-    const restartOptions = cmd.opts<RestartCommandOptions>();
+    const restartOptions = cmd.optsWithGlobals<RestartCommandOptions>();
     await restartSession(sessionId, restartOptions);
   });
 
@@ -1442,6 +1448,11 @@ function buildRunOptions(
     browserBundleFiles: overrides.browserBundleFiles ?? options.browserBundleFiles ?? false,
     browserBundleFormat: overrides.browserBundleFormat ?? options.browserBundleFormat ?? "auto",
     generateImage: overrides.generateImage ?? options.generateImage,
+    youtube: overrides.youtube ?? options.youtube,
+    editImage: overrides.editImage ?? options.editImage,
+    aspectRatio: overrides.aspectRatio ?? options.aspect,
+    geminiShowThoughts: overrides.geminiShowThoughts ?? options.geminiShowThoughts,
+    geminiAllowModelFallback: overrides.geminiAllowModelFallback ?? options.geminiFallback,
     outputPath: overrides.outputPath ?? options.output,
     browserFollowUps: overrides.browserFollowUps ?? options.browserFollowUp ?? [],
     background: overrides.background ?? undefined,
@@ -1746,6 +1757,11 @@ function buildRunOptionsFromMetadata(metadata: SessionMetadata): RunOracleOption
     browserBundleFiles: stored.browserBundleFiles,
     browserBundleFormat: stored.browserBundleFormat,
     generateImage: stored.generateImage,
+    youtube: stored.youtube,
+    editImage: stored.editImage,
+    aspectRatio: stored.aspectRatio,
+    geminiShowThoughts: stored.geminiShowThoughts,
+    geminiAllowModelFallback: stored.geminiAllowModelFallback,
     outputPath: stored.outputPath,
     browserFollowUps: stored.browserFollowUps,
     background: stored.background,
@@ -2226,6 +2242,8 @@ async function runRootCommand(options: CliOptions): Promise<void> {
       browserRequestedModel: cliModelArg,
       browserModelLabel: resolveBrowserModelLabel(cliModelArg, activeModel),
     });
+    config.modelIsImplicitDefault =
+      optionUsesDefault("model") && !userConfig.model && !options.browserModelLabel;
     return resolvedOptions.browserResumeConversationUrl
       ? { ...config, resumeConversationUrl: resolvedOptions.browserResumeConversationUrl }
       : config;
@@ -2331,30 +2349,20 @@ async function runRootCommand(options: CliOptions): Promise<void> {
 
   let browserDeps: BrowserSessionRunnerDeps | undefined;
   if (browserConfig && remoteHost) {
-    const { createRemoteBrowserExecutor } = await import("../src/remote/client.js");
+    const { resolveBrowserExecutor } = await import("../src/browser/executor.js");
     browserDeps = {
-      executeBrowser: createRemoteBrowserExecutor({ host: remoteHost, token: remoteToken }),
+      executeBrowser: await resolveBrowserExecutor(
+        { ...resolvedOptions, model: activeModel },
+        { host: remoteHost, token: remoteToken },
+      ),
     };
     console.log(chalk.dim(`Routing browser automation to remote host ${remoteHost}`));
   } else if (browserConfig && activeModel.startsWith("gemini")) {
-    const { createGeminiWebExecutor } = await import("../src/gemini-web/index.js");
-    browserDeps = {
-      executeBrowser: createGeminiWebExecutor({
-        youtube: options.youtube,
-        generateImage: options.generateImage,
-        editImage: options.editImage,
-        outputPath: options.output,
-        aspectRatio: options.aspect,
-        showThoughts: options.geminiShowThoughts,
-        allowModelFallback: options.geminiFallback,
-      }),
-    };
     console.log(chalk.dim("Using Gemini web client for browser automation"));
     if (browserConfig.modelStrategy && browserConfig.modelStrategy !== "select") {
       console.log(chalk.dim("Browser model strategy is ignored for Gemini web runs."));
     }
   }
-  const remoteExecutionActive = Boolean(browserDeps);
 
   if (options.dryRun) {
     const baseRunOptions = buildRunOptions(resolvedOptions, {
@@ -2419,13 +2427,6 @@ async function runRootCommand(options: CliOptions): Promise<void> {
       followupModel: resolvedOptions.followupModel,
       browserResumeConversationUrl: resolvedOptions.browserResumeConversationUrl,
       waitPreference,
-      youtube: options.youtube,
-      generateImage: options.generateImage,
-      editImage: options.editImage,
-      outputPath: options.output,
-      aspectRatio: options.aspect,
-      geminiShowThoughts: options.geminiShowThoughts,
-      geminiAllowModelFallback: options.geminiFallback,
     },
     process.cwd(),
     notifications,
@@ -2436,15 +2437,16 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     effectiveModelId: resolvedOptions.effectiveModelId ?? effectiveModelId,
   };
   const disableDetachEnv = process.env.ORACLE_NO_DETACH === "1";
-  const detachAllowed = remoteExecutionActive
-    ? false
-    : shouldDetachSession({
-        engine,
-        model: activeModel,
-        reasoningMode: resolvedOptions.reasoningMode,
-        waitPreference,
-        disableDetachEnv,
-      });
+  const detachAllowed =
+    browserConfig && (remoteHost || activeModel.startsWith("gemini"))
+      ? false
+      : shouldDetachSession({
+          engine,
+          model: activeModel,
+          reasoningMode: resolvedOptions.reasoningMode,
+          waitPreference,
+          disableDetachEnv,
+        });
   let lifecycle = buildSessionLifecycle({
     engine,
     detached: false,
@@ -2716,30 +2718,20 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
 
   let browserDeps: BrowserSessionRunnerDeps | undefined;
   if (browserConfig && remoteHost) {
-    const { createRemoteBrowserExecutor } = await import("../src/remote/client.js");
+    const { resolveBrowserExecutor } = await import("../src/browser/executor.js");
     browserDeps = {
-      executeBrowser: createRemoteBrowserExecutor({ host: remoteHost, token: remoteToken }),
+      executeBrowser: await resolveBrowserExecutor(runOptions, {
+        host: remoteHost,
+        token: remoteToken,
+      }),
     };
     console.log(chalk.dim(`Routing browser automation to remote host ${remoteHost}`));
   } else if (browserConfig && runOptions.model.startsWith("gemini")) {
-    const { createGeminiWebExecutor } = await import("../src/gemini-web/index.js");
-    browserDeps = {
-      executeBrowser: createGeminiWebExecutor({
-        youtube: storedOptions.youtube,
-        generateImage: storedOptions.generateImage,
-        editImage: storedOptions.editImage,
-        outputPath: storedOptions.outputPath,
-        aspectRatio: storedOptions.aspectRatio,
-        showThoughts: storedOptions.geminiShowThoughts,
-        allowModelFallback: storedOptions.geminiAllowModelFallback,
-      }),
-    };
     console.log(chalk.dim("Using Gemini web client for browser automation"));
     if (browserConfig.modelStrategy && browserConfig.modelStrategy !== "select") {
       console.log(chalk.dim("Browser model strategy is ignored for Gemini web runs."));
     }
   }
-  const remoteExecutionActive = Boolean(browserDeps);
 
   if (sessionMode === "api") {
     validateApiProviderRoutingForCli(runOptions);
@@ -2759,13 +2751,6 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
       followupSessionId: storedOptions.followupSessionId,
       followupModel: storedOptions.followupModel,
       waitPreference,
-      youtube: storedOptions.youtube,
-      generateImage: storedOptions.generateImage,
-      editImage: storedOptions.editImage,
-      outputPath: storedOptions.outputPath,
-      aspectRatio: storedOptions.aspectRatio,
-      geminiShowThoughts: storedOptions.geminiShowThoughts,
-      geminiAllowModelFallback: storedOptions.geminiAllowModelFallback,
     },
     cwd,
     notifications,
@@ -2779,15 +2764,16 @@ async function restartSession(sessionId: string, options: RestartCommandOptions)
   };
 
   const disableDetachEnv = process.env.ORACLE_NO_DETACH === "1";
-  const detachAllowed = remoteExecutionActive
-    ? false
-    : shouldDetachSession({
-        engine,
-        model: runOptions.model,
-        reasoningMode: runOptions.reasoningMode,
-        waitPreference,
-        disableDetachEnv,
-      });
+  const detachAllowed =
+    browserConfig && (remoteHost || runOptions.model.startsWith("gemini"))
+      ? false
+      : shouldDetachSession({
+          engine,
+          model: runOptions.model,
+          reasoningMode: runOptions.reasoningMode,
+          waitPreference,
+          disableDetachEnv,
+        });
   let lifecycle = buildSessionLifecycle({
     engine,
     detached: false,
@@ -3095,12 +3081,6 @@ async function main(): Promise<void> {
 }
 
 void main().catch((error: unknown) => {
-  if (error instanceof Error) {
-    if (!isErrorLogged(error)) {
-      console.error(chalk.red("✖"), error.message);
-    }
-  } else {
-    console.error(chalk.red("✖"), error);
-  }
+  if (!isErrorLogged(error)) console.error(chalk.red("✖"), formatCliError(error));
   process.exitCode = 1;
 });
