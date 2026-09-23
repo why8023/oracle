@@ -3,6 +3,15 @@
 ## Unreleased
 
 - Deep Research: retain downloaded reports and comparison exports alongside opt-in provider conversation evidence, including links in the saved transcript.
+- Browser: preserve reachable IPv6 Chrome profiles and release failed DevTools probe timers promptly; thanks @devYRPauli.
+
+## 0.21.2 - 2026-09-22
+
+**Highlights:** Reliable process identity on localized systems and working verbose CLI help.
+
+- Browser: preserve process identity and stale-lock recovery on non-English systems by normalizing process timestamps; thanks @zianai.
+- CLI: show advanced options with `--help --verbose` and `-h --verbose` in either flag order, without starting a session; fixes #500, thanks @postoso.
+- Dependencies: refresh provider SDKs, terminal rendering and progress, token pricing, and browser tooling while retaining Node >=24 and compatible Gemini HTTP dispatch; thanks @dependabot.
 
 ## 0.21.1 - 2026-09-14
 
