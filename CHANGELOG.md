@@ -3,6 +3,14 @@
 ## Unreleased
 
 - Deep Research: retain downloaded reports and comparison exports alongside opt-in provider conversation evidence, including links in the saved transcript.
+- Browser: warn when a configured Chrome executable cannot replace a running shared profile, explain how to switch safely, and share reuse handling with Project Sources; fixes #510, thanks @Sogl.
+
+## 0.21.3 - 2026-09-24
+
+**Highlights:** Reliable session flags, preserved file aliases, and IPv6 Chrome profile probes.
+
+- CLI: honor session model and rendering flags, serve cookie sync, and background bridge startup; keep bridge credentials out of child-process arguments and rotate them on ordinary restarts; thanks @vincent-peng.
+- CLI: restore `session <id> --path` while preserving the root `--path` file alias, including flags before the subcommand; fixes #509, thanks @vincent-peng.
 - Browser: preserve reachable IPv6 Chrome profiles and release failed DevTools probe timers promptly; thanks @devYRPauli.
 
 ## 0.21.2 - 2026-09-22
