@@ -3,7 +3,23 @@
 ## Unreleased
 
 - Deep Research: retain downloaded reports and comparison exports alongside opt-in provider conversation evidence, including links in the saved transcript.
+- Browser: use fresh cold-launch ports and live attach endpoints, wait for HTTP 404 approval responses, exclude volatile copied-profile session state while preserving auth storage, and report partial cookie transfers safely; fixes #535, #537, #538, and #540, improves #541; thanks @webkitvn and @Sogl.
+- Browser: dismiss blocking UI only inside visible dialogs, so a sidebar conversation whose title contains a word like "close" is no longer clicked after opening a ChatGPT project URL; fixes #534, thanks @tlq5l and @webkitvn.
+- Files: look for `.gitignore` files only in the directories and glob bases passed to `--file` and their parents under the working directory, instead of walking the whole working directory, so a small bundle no longer takes seconds to minutes when oracle runs from a home directory, and stop a `.gitignore` in `foo/` from applying to files in a sibling `foobar/`; fixes #532, thanks @postoso.
+- Browser: recognize Japanese Chat/Work effort controls and assistant completion/copy signals while preserving current-turn verification; thanks @kiyo-e.
+- Dependencies: refresh provider and MCP SDKs, Chrome tooling, terminal dependencies, Vitest/coverage, Hono, and Vite within the two-day cooldown; retain Node >=24 and Undici 7 compatibility; thanks @dependabot.
+- Files: apply default-ignored directory names only below the directory or glob base passed to `--file`, so a bundle under `/tmp` or a `build/` folder is no longer dropped when oracle runs from elsewhere; fixes #531, thanks @postoso.
+
+## 0.21.4 - 2026-10-01
+
+**Highlights:** Reliable ChatGPT Chat/Work automation and accurate provider reasoning-token accounting.
+
+- Browser: support ChatGPT's Chat/Work composer, model and effort controls, turn identity, Markdown and file capture; preserve Work-conversation guards, paste multiline prompts intact, wait for attachment hydration without duplicate uploads, and persist new macOS manual-login profiles with the native Keychain; fixes #517, thanks @Cjschmi2, @moeuu, @hongho55, @StartupBros, @lifeofgurpreet, @rugnasyab, @cafeSowoo, and @Gerry9000.
 - Browser: warn when a configured Chrome executable cannot replace a running shared profile, explain how to switch safely, and share reuse handling with Project Sources; fixes #510, thanks @Sogl.
+- API: include Gemini thinking tokens in billed output, cost, and token totals, bill xAI reasoning tokens as output, and show reported reasoning tokens for OpenAI Responses and custom-gateway runs; thanks @devYRPauli.
+- Dependencies: update pinned Hono to 4.13.11, its Node adapter to 2.1.3, and pnpm to 11.28.2 while retaining the two-day release-age policy and Node >=24.
+- Dependencies: update MCP server/client to 2.2.0, the legacy MCP SDK to 1.31.0, oxfmt to 0.71.0, and oxlint to 1.86.0 within the two-day release-age policy; retain Node >=24.
+- Dependencies: refresh provider/MCP SDKs, cookie and browser tooling, test tooling, and pnpm within the two-day release-age policy; update dotenv's compatible preload entrypoint, retain Node >=24, and keep Undici on v7 for native-fetch compatibility; thanks @dependabot.
 
 ## 0.21.3 - 2026-09-24
 

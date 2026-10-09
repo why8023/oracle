@@ -2232,7 +2232,7 @@ describe("waitForDeepResearchCompletion", () => {
         querySelector: () => null,
         querySelectorAll: (selector: string) => {
           if (selector === "iframe") return [];
-          if (selector === '[data-message-author-role="assistant"]') {
+          if (selector.includes('[data-message-author-role="assistant"]')) {
             return [priorFinishedTurn];
           }
           return [];
@@ -2322,7 +2322,7 @@ describe("checkDeepResearchStatus", () => {
         querySelector: (selector: string) => (selector.includes("copy") ? {} : null),
         querySelectorAll: (selector: string) => {
           if (selector === "iframe") return [];
-          if (selector === '[data-message-author-role="assistant"]') return [assistantTurn];
+          if (selector.includes('[data-message-author-role="assistant"]')) return [assistantTurn];
           return [];
         },
       },
@@ -2495,7 +2495,7 @@ describe("checkDeepResearchStatus", () => {
         querySelector: (selector: string) => (selector.includes("copy") ? {} : null),
         querySelectorAll: (selector: string) => {
           if (selector === "iframe") return [];
-          if (selector === '[data-message-author-role="assistant"]') {
+          if (selector.includes('[data-message-author-role="assistant"]')) {
             return [priorFinishedTurn, currentResearchTurn];
           }
           return [];

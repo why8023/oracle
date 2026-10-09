@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import * as childProcess from "node:child_process";
 import net from "node:net";
@@ -25,9 +25,14 @@ export async function launchChrome(
   logger: BrowserLogger,
 ) {
   const { connectHost, debugBindAddress, usePatchedLauncher } = resolveWslChromeLaunchRoute();
-  const debugPort = config.debugPort ?? parseDebugPortEnv();
+  // Persistent stderr logs can contain an older browser's dynamically assigned port.
+  const debugPort = (config.debugPort ?? parseDebugPortEnv()) || (await findEphemeralPort());
   const usingCopiedProfile = Boolean(config.copyProfileSource);
   const detachSharedChrome = shouldDetachSharedChrome(config);
+  const nativeKeychainMarker = path.join(userDataDir, ".oracle-native-keychain-v1");
+  const nativeManualLogin =
+    config.manualLogin === true &&
+    (await shouldUseNativeManualLoginKeychain(userDataDir, process.platform));
   const launchedProfileDirectory =
     usingCopiedProfile && config.chromeProfile ? config.chromeProfile : "Default";
   await prepareChromeWindowStateForHiddenLaunch({
@@ -41,14 +46,16 @@ export async function launchChrome(
     debugBindAddress,
     config.hideWindow ?? false,
   );
-  // copy-profile reuses a copied signed-in profile whose cookies are
-  // Keychain-encrypted, so it must launch with the real Keychain (not mocked):
-  // strip the keychain-mocking flags from both chrome-launcher's defaults and
-  // Oracle's set, and ignore the defaults so they aren't re-added.
+  // New macOS manual-login profiles use the real Keychain. Keep the launcher's
+  // mock Keychain for existing profiles until users choose a new profile path.
   if (usingCopiedProfile && config.chromeProfile) {
     chromeFlags.push(`--profile-directory=${config.chromeProfile}`);
   }
-  const launchOptions = resolveChromeLaunchOptions(chromeFlags, usingCopiedProfile);
+  const launchOptions = resolveChromeLaunchOptions(
+    chromeFlags,
+    usingCopiedProfile,
+    nativeManualLogin,
+  );
   const launcher = usePatchedLauncher
     ? await launchWithCustomHost({
         chromeFlags: launchOptions.chromeFlags,
@@ -71,6 +78,13 @@ export async function launchChrome(
         detachSharedChrome,
       );
   const pidLabel = typeof launcher.pid === "number" ? ` (pid ${launcher.pid})` : "";
+  if (nativeManualLogin) {
+    await writeFile(nativeKeychainMarker, "native-keychain\n");
+  } else if (config.manualLogin && process.platform === "darwin" && !usingCopiedProfile) {
+    logger(
+      "[browser] Existing manual-login profile retains its saved Chrome login. To use the native Keychain, choose a new --browser-manual-login-profile-dir and sign in once.",
+    );
+  }
   const hostLabel = connectHost ? ` on ${connectHost}` : "";
   logger(`Launched Chrome${pidLabel} on port ${launcher.port}${hostLabel}`);
   if (detachSharedChrome) {
@@ -79,6 +93,19 @@ export async function launchChrome(
   return Object.assign(launcher, { host: connectHost ?? "127.0.0.1" }) as LaunchedChrome & {
     host?: string;
   };
+}
+
+export async function shouldUseNativeManualLoginKeychain(
+  userDataDir: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<boolean> {
+  if (platform !== "darwin") return false;
+  const exists = (filePath: string) =>
+    access(filePath)
+      .then(() => true)
+      .catch(() => false);
+  if (await exists(path.join(userDataDir, ".oracle-native-keychain-v1"))) return true;
+  return !(await exists(path.join(userDataDir, "Local State")));
 }
 
 function shouldDetachSharedChrome(
@@ -771,7 +798,7 @@ async function connectToBrowserWebSocket(
 
 function isRemoteDebuggingApprovalError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error ?? "");
-  return /unexpected server response:\s*403|remote debugging|forbidden/i.test(message);
+  return /unexpected server response:\s*(?:403|404)\b|remote debugging|forbidden/i.test(message);
 }
 
 function formatApprovalWait(waitMs: number): string {
@@ -1204,8 +1231,10 @@ export function buildChromeFlagsForTest(
 function resolveChromeLaunchOptions(
   chromeFlags: string[],
   usingCopiedProfile: boolean,
+  manualLogin = false,
+  platform: NodeJS.Platform = process.platform,
 ): { chromeFlags: string[]; ignoreDefaultFlags: boolean } {
-  if (!usingCopiedProfile) {
+  if (!usingCopiedProfile && !(manualLogin && platform === "darwin")) {
     return { chromeFlags, ignoreDefaultFlags: false };
   }
   return {
@@ -1219,8 +1248,10 @@ function resolveChromeLaunchOptions(
 export function resolveChromeLaunchOptionsForTest(
   chromeFlags: string[],
   usingCopiedProfile: boolean,
+  manualLogin = false,
+  platform: NodeJS.Platform = process.platform,
 ): { chromeFlags: string[]; ignoreDefaultFlags: boolean } {
-  return resolveChromeLaunchOptions(chromeFlags, usingCopiedProfile);
+  return resolveChromeLaunchOptions(chromeFlags, usingCopiedProfile, manualLogin, platform);
 }
 
 function parseDebugPortEnv(): number | null {
@@ -1231,6 +1262,21 @@ function parseDebugPortEnv(): number | null {
     return null;
   }
   return value;
+}
+
+export async function findEphemeralPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      server.close((error) => {
+        if (error) reject(error);
+        else if (address && typeof address === "object") resolve(address.port);
+        else reject(new Error("Failed to acquire ephemeral port"));
+      });
+    });
+  });
 }
 
 async function launchWithCustomHost({
