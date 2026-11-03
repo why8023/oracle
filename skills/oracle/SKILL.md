@@ -147,9 +147,18 @@ are essential to the question.
   4.x; availability depends on engine and provider.
 - API runs require explicit user consent because they may incur usage costs.
 - Browser attachments use `--browser-attachments auto|never|always`.
-- For many files, add `--browser-bundle-files --browser-bundle-format auto|zip`.
+- Browser uploads keep one text/source file native and bundle multiple
+  text/source files. `auto` keeps flattened text for text-only uploads; use
+  `--browser-bundle-format zip` for a filesystem tree, or `--browser-bundle-files`
+  to force every resolved attachment into one bundle.
 - Reuse an existing Chrome session with `--browser-tab <ref>`,
   `--browser-attach-running`, or `--remote-chrome <host:port>`.
+- Add `--browser-no-focus` (config `browser.noFocus`) to keep Chrome in the
+  background during launch, new tabs, and send. When
+  focus emulation is available, an ordinary run does not steal keyboard focus
+  or switch macOS Spaces; if it cannot be enabled, Oracle tries to bring
+  Chrome forward before clicking. A reattach that falls back to relaunching
+  Chrome can still activate it.
 - Use `--browser-model-strategy select|current|ignore` to control picker
   behavior.
 - Use `--browser-follow-up "<prompt>"` for another turn in the same browser

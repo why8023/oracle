@@ -1,3 +1,4 @@
+import type { ProviderNativeCaptureSummary } from "./browser/chatgptConversation.js";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { createWriteStream, mkdirSync } from "node:fs";
@@ -8,6 +9,7 @@ import type {
   BrowserArchiveMode,
   BrowserArchiveResult,
   BrowserModelStrategy,
+  BrowserResearchPlanMetadata,
   BrowserResearchMode,
   CookieParam,
 } from "./browser/types.js";
@@ -41,6 +43,8 @@ export interface BrowserSessionConfig {
   timeoutMs?: number;
   debugPort?: number | null;
   inputTimeoutMs?: number;
+  /** Time budget for each Chrome remote-debugging approval prompt. */
+  approvalWaitMs?: number;
   /** Time budget for attachment upload/readiness before clicking send. */
   attachmentTimeoutMs?: number;
   /** Delay before rechecking the conversation after an assistant timeout. */
@@ -67,7 +71,10 @@ export interface BrowserSessionConfig {
   headless?: boolean;
   keepBrowser?: boolean;
   hideWindow?: boolean;
+  noFocus?: boolean;
   desiredModel?: string | null;
+  /** The caller omitted a model and inherited Oracle's browser default. */
+  modelIsImplicitDefault?: boolean;
   modelStrategy?: BrowserModelStrategy;
   debug?: boolean;
   allowCookieErrors?: boolean;
@@ -85,6 +92,16 @@ export interface BrowserSessionConfig {
   archiveConversations?: BrowserArchiveMode;
   /** Browser-only: existing ChatGPT conversation URL to resume before submitting. */
   resumeConversationUrl?: string | null;
+  /** Capture ChatGPT's own conversation document plus independent per-turn digests. */
+  captureProviderNative?: boolean;
+}
+
+export interface BrowserRecoveryTarget {
+  host: string;
+  port: number;
+  targetId: string;
+  browserWSEndpoint?: string;
+  claimId?: string;
 }
 
 export interface BrowserRuntimeMetadata {
@@ -96,15 +113,30 @@ export interface BrowserRuntimeMetadata {
   chromeProfileRoot?: string;
   userDataDir?: string;
   chromeTargetId?: string;
+  /** Explicitly created by Oracle and eligible for retirement after persisted recovery. */
+  ownedRecoveryTarget?: BrowserRecoveryTarget;
   tabUrl?: string;
   conversationId?: string;
   /** True after Oracle has submitted the prompt to ChatGPT. */
   promptSubmitted?: boolean;
+  /** Fingerprint of committed user text and stable message ID; null until commitment is confirmed. */
+  submittedPromptHash?: string | null;
+  /** Latest Deep Research plan captured from ChatGPT's out-of-process iframe. */
+  researchPlan?: BrowserResearchPlanMetadata;
   /** PID of the controller process that launched this browser run. Helps detect orphaned sessions. */
   controllerPid?: number;
 }
 
 export type BrowserHarvestState = "running" | "completed" | "stalled" | "detached";
+
+export interface BrowserHarvestIntegrity {
+  status: "matched" | "mismatch" | "unverified";
+  observedConversationId?: string;
+  captured: Array<{ source: string; conversationId: string }>;
+  unverifiedSources: string[];
+  explicitTarget: boolean;
+  previousHarvestConversationId?: string;
+}
 
 export interface BrowserHarvestMetadata {
   targetId?: string;
@@ -118,6 +150,7 @@ export interface BrowserHarvestMetadata {
   assistantCount?: number;
   currentModelLabel?: string;
   lastAssistantSnippet?: string;
+  integrity?: BrowserHarvestIntegrity;
 }
 
 export type BrowserModelSelectionEvidenceStatus =
@@ -137,6 +170,25 @@ export interface BrowserModelSelectionEvidence {
   capturedAt: string;
 }
 
+export type BrowserThinkingSelectionStatus = "already-selected" | "switched" | "unverified";
+
+/**
+ * Selection-time UI evidence, separate from the model picker record.
+ * `verified` confirms the observed selected state at `capturedAt`; it does not
+ * attest backend effort or later UI changes. Strict requests throw if unconfirmed.
+ */
+export interface BrowserThinkingSelectionEvidence {
+  requestedLevel: ThinkingTimeLevel;
+  status: BrowserThinkingSelectionStatus;
+  resolvedLabel?: string | null;
+  verified: boolean;
+  strictFailClosed: boolean;
+  targetModelKind?: string | null;
+  observedModelKind?: string | null;
+  source: "chatgpt-thinking-picker";
+  capturedAt: string;
+}
+
 export interface BrowserRunWarning {
   code: string;
   severity: "warning";
@@ -150,6 +202,8 @@ export interface BrowserMetadata {
   harvest?: BrowserHarvestMetadata;
   archive?: BrowserArchiveResult;
   modelSelection?: BrowserModelSelectionEvidence;
+  thinkingSelection?: BrowserThinkingSelectionEvidence;
+  providerNativeCapture?: ProviderNativeCaptureSummary;
   warnings?: BrowserRunWarning[];
 }
 
@@ -246,6 +300,7 @@ export interface StoredRunOptions {
   modelOverrides?: ModelOverridesConfig;
   renderPlain?: boolean;
   writeOutputPath?: string;
+  writeArtifacts?: boolean;
   partialMode?: PartialMode;
   timeoutSeconds?: number | "auto";
   httpTimeoutMs?: number;
@@ -261,6 +316,7 @@ export interface StoredRunOptions {
   browserResumeConversationUrl?: string;
   aspectRatio?: string;
   geminiShowThoughts?: boolean;
+  geminiAllowModelFallback?: boolean;
 }
 
 export interface SessionMetadata {
@@ -493,9 +549,41 @@ async function writeSessionMetadataFile(
       encoding: "utf8",
       mode: 0o600,
     });
-    await fs.rename(temporaryPath, targetPath);
+    await renameSessionMetadataFile(temporaryPath, targetPath);
   } finally {
     await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
+  }
+}
+
+const METADATA_RENAME_RETRY_DELAYS_MS = [10, 25, 50, 100, 200, 400, 800] as const;
+const RETRIABLE_METADATA_RENAME_CODES = new Set(["EACCES", "EBUSY", "EPERM"]);
+
+function isRetriableMetadataRenameError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof error.code === "string" &&
+    RETRIABLE_METADATA_RENAME_CODES.has(error.code)
+  );
+}
+
+async function renameSessionMetadataFile(temporaryPath: string, targetPath: string): Promise<void> {
+  for (const delayMs of [0, ...METADATA_RENAME_RETRY_DELAYS_MS]) {
+    if (delayMs > 0) {
+      await wait(delayMs);
+    }
+    try {
+      await fs.rename(temporaryPath, targetPath);
+      return;
+    } catch (error) {
+      if (
+        !isRetriableMetadataRenameError(error) ||
+        delayMs === METADATA_RENAME_RETRY_DELAYS_MS.at(-1)
+      ) {
+        throw error;
+      }
+    }
   }
 }
 
@@ -656,7 +744,15 @@ export async function initializeSession(
     })),
     cwd,
     mode,
-    browser: browserConfig ? { config: browserConfig } : undefined,
+    browser:
+      mode === "browser"
+        ? {
+            ...(browserConfig ? { config: browserConfig } : {}),
+            runtime: { submittedPromptHash: null },
+          }
+        : browserConfig
+          ? { config: browserConfig }
+          : undefined,
     notifications,
     options: {
       prompt: options.prompt,
@@ -695,6 +791,7 @@ export async function initializeSession(
       zombieTimeoutMs: options.zombieTimeoutMs,
       zombieUseLastActivity: options.zombieUseLastActivity,
       writeOutputPath: options.writeOutputPath,
+      writeArtifacts: options.writeArtifacts,
       partialMode: options.partialMode,
       waitPreference: options.waitPreference,
       youtube: options.youtube,
@@ -705,6 +802,7 @@ export async function initializeSession(
       browserResumeConversationUrl: options.browserResumeConversationUrl,
       aspectRatio: options.aspectRatio,
       geminiShowThoughts: options.geminiShowThoughts,
+      geminiAllowModelFallback: options.geminiAllowModelFallback,
     },
   };
   await ensureDir(modelsDir(sessionId));
@@ -867,7 +965,23 @@ export async function listSessionsMetadata(): Promise<SessionMetadata[]> {
       metas.push(meta);
     }
   }
-  return metas.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  return metas.sort((a, b) => {
+    const left = sessionSortTime(a);
+    const right = sessionSortTime(b);
+    return right > left ? 1 : right < left ? -1 : 0;
+  });
+}
+
+// Some stored sessions lack a valid createdAt; a NaN comparator result would leave the list
+// partitioned rather than sorted, so fall back to other timestamps and sort the rest last.
+function sessionSortTime(meta: SessionMetadata): number {
+  for (const value of [meta.createdAt, meta.startedAt, meta.completedAt]) {
+    const time = value ? Date.parse(value) : Number.NaN;
+    if (!Number.isNaN(time)) {
+      return time;
+    }
+  }
+  return Number.NEGATIVE_INFINITY;
 }
 
 export function filterSessionsByRange(

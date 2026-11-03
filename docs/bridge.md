@@ -9,9 +9,13 @@ Oracle’s bridge workflow lets you keep an authenticated ChatGPT session on a W
 
 The host sanitizes incoming attachment filenames for staging. If names collide after sanitization (or differ only by case), later uploads receive a unique numeric suffix before the extension, while their original display paths and payload order are retained. This applies to both primary uploads and prompt-size fallback uploads. Non-colliding filenames are unchanged; supplied names such as `a_b-2.txt` are reserved before suffix allocation.
 
+## Run admission and cancellation
+
+`oracle serve` also offers opt-in bounded admission via `--max-concurrent-runs` and `--max-queued-runs`; see [concurrent admission](browser-mode.md#optional-concurrent-admission). The default remains single-flight HTTP 409. Explicit programmatic cancellation requires the host's `runCancellation` capability; generated-file transfers honor the caller's AbortSignal and remove incomplete transfer files.
+
 ## Generated artifact transfer
 
-Bridge runs now keep the Windows browser host and Linux client separated while still returning ChatGPT-generated files, such as ZIP, CSV, PDF, wheels, and source distributions, to a cloud-readable path. The host advertises artifact-transfer support from the token-protected `GET /health` response. The Linux client uses that capability signal in `oracle bridge client --test` and `oracle bridge doctor`; older hosts remain usable for text responses, but generated files require manual copy from the Windows browser until both sides are upgraded.
+Bridge runs now keep the Windows browser host and Linux client separated while still returning ChatGPT-generated files and images, such as PNG, ZIP, CSV, PDF, wheels, and source distributions, to a cloud-readable path. The host advertises artifact-transfer support from the token-protected `GET /health` response. The Linux client uses that capability signal in `oracle bridge client --test` and `oracle bridge doctor`; older hosts remain usable for text responses. Explicit image-output requests require the host to advertise `generatedImages: true` with artifact protocol v1; otherwise the client refuses before sending the prompt or attachments and asks for a host upgrade. Other generated artifacts still require manual copying when the host lacks artifact transfer.
 
 The transfer protocol is pull-based and keeps secrets local to the host:
 
@@ -25,6 +29,7 @@ Operational notes:
 - Run the same patched Oracle version on both Windows host and Linux client before relying on automatic file transfer. Mixed versions remain backward compatible for text-only runs.
 - `oracle bridge doctor` reports `Artifact transfer: bridge v1` when the host supports the protocol, including the advertised maximum artifact size.
 - The default bridge transfer size limit is 512 MiB. Larger files stay on the browser host and require manual copy.
+- Incoming `POST /runs` bodies are capped at 1,432,704,342 bytes (two base64 attachment sets at the 512 MiB artifact cap, plus a 1 MiB JSON envelope). Oversized bodies receive HTTP 413 with `payload_too_large` before a browser run starts, including chunked uploads without a declared length.
 - Session inspection prints artifact path, size, SHA-256 prefix, validation status, and transfer status so agents can verify whether the returned path is local to the Linux client.
 
 ## 1) Windows: start the host service (recommended)
@@ -162,3 +167,7 @@ It checks:
 - Tokens are not printed by default.
 - The connection artifact and config file contain secrets; keep them private (Oracle writes them with restrictive permissions on Unix).
 - Bridge does **not** extract/decrypt cookies from arbitrary profiles; the Windows machine keeps the authenticated session locally.
+
+Cancellation also removes Oracle’s attachment input, prompt, and send guards from retained tabs. Guard cleanup runs outside the aborted request scope; it does not cancel provider processing that already received a file or prompt.
+
+With opt-in queue admission, capacity is reserved when authenticated request headers arrive, before buffering the JSON body. Active/queued health counts include body reception; invalid or disconnected uploads release their reservation. This bounds concurrent body buffers by the configured active-plus-queued capacity and preserves admission order across slow uploads. The existing individual payload-size policy is unchanged.

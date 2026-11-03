@@ -5,6 +5,7 @@ import {
   CONVERSATION_TURN_SELECTOR,
   STOP_BUTTON_SELECTORS,
 } from "../constants.js";
+import { buildConversationTurnListExpression } from "../conversationTurns.js";
 
 const THINKING_STALE_HINT_MS = 10 * 60_000;
 
@@ -254,7 +255,7 @@ function buildThinkingStatusExpression(): string {
       if (!(node instanceof HTMLElement)) return false;
       const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
       if (turnAttr === 'assistant') return true;
-      const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
+      const role = (node.getAttribute('data-message-author-role') || (node.getAttribute?.('data-content-search-unit-key') || node.getAttribute?.('data-chatgpt-search-unit-key'))?.split(':').at(-1) || node.dataset?.messageAuthorRole || '').toLowerCase();
       if (role === 'assistant') return true;
       const testId = (node.getAttribute('data-testid') || '').toLowerCase();
       if (testId.includes('assistant')) return true;
@@ -481,7 +482,6 @@ const ACTIVE_THINKING_LABELS = [
 function buildThinkingActivityPredicateJs(fnName: string, detailed: boolean): string {
   const stopLiteral = JSON.stringify(STOP_BUTTON_SELECTORS.join(", "));
   const activeLabelsLiteral = JSON.stringify(ACTIVE_THINKING_LABELS);
-  const conversationLiteral = JSON.stringify(CONVERSATION_TURN_SELECTOR);
   const assistantLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
   const strong = detailed ? "{ active: true, strong: true }" : "true";
   const weak = detailed ? "{ active: true, strong: false }" : "true";
@@ -489,7 +489,6 @@ function buildThinkingActivityPredicateJs(fnName: string, detailed: boolean): st
   return `const ${fnName} = () => {
     const STOP_SELECTOR = ${stopLiteral};
     const ACTIVE_LABELS = ${activeLabelsLiteral};
-    const CONVERSATION_SELECTOR = ${conversationLiteral};
     const ASSISTANT_SELECTOR = ${assistantLiteral};
     const isVisible = (node) => {
       if (!(node instanceof HTMLElement)) return false;
@@ -592,9 +591,7 @@ function buildThinkingActivityPredicateJs(fnName: string, detailed: boolean): st
     // a visible progress bar mounted indefinitely (review P1), and a document-wide veto would
     // then hold thinkingActive true until the watchdog timeout on a completed response. The
     // sidecar check below covers verified reasoning panels; here only the latest turn counts.
-    const turns = (() => {
-      try { return document.querySelectorAll(CONVERSATION_SELECTOR); } catch { return []; }
-    })();
+    const turns = ${buildConversationTurnListExpression()};
     const lastTurn = turns.length ? turns[turns.length - 1] : null;
     if (
       lastTurn instanceof HTMLElement &&
@@ -655,6 +652,8 @@ export function buildThinkingActivePredicateJs(fnName: string): string {
 export interface ThinkingActivity {
   active: boolean;
   strong: boolean;
+  // False when this read failed. That is not a successful idle read.
+  known: boolean;
 }
 
 export function buildThinkingActivityDetailsPredicateJs(fnName: string): string {
@@ -665,17 +664,29 @@ export async function readThinkingActivity(
   Runtime: ChromeClient["Runtime"],
 ): Promise<ThinkingActivity> {
   try {
-    const { result } = await Runtime.evaluate({
+    const { result, exceptionDetails } = await Runtime.evaluate({
       expression: `(() => {
         ${buildThinkingActivityDetailsPredicateJs("readThinkingActivity")}
         return readThinkingActivity();
       })()`,
       returnByValue: true,
     });
-    const value = result?.value as Partial<ThinkingActivity> | undefined;
-    return { active: Boolean(value?.active), strong: Boolean(value?.strong) };
+    // A throw, an exception, or a missing value did not tell us whether thinking
+    // is running. A boolean or null still means the page check finished.
+    if (exceptionDetails || result?.value === undefined) {
+      return { active: false, strong: false, known: false };
+    }
+    const value = result.value as Partial<ThinkingActivity> | null;
+    if (value && typeof value === "object") {
+      return {
+        active: Boolean(value.active),
+        strong: Boolean(value.strong),
+        known: true,
+      };
+    }
+    return { active: false, strong: false, known: true };
   } catch {
-    return { active: false, strong: false };
+    return { active: false, strong: false, known: false };
   }
 }
 

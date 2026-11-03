@@ -7,6 +7,7 @@ import { normalizeThinkingTimeLevel } from "../oracle/thinkingTime.js";
 import { CHATGPT_URL, DEFAULT_MODEL_STRATEGY, DEFAULT_MODEL_TARGET } from "../browser/constants.js";
 import { normalizeChatgptUrl } from "../browser/utils.js";
 import { parseDuration } from "../duration.js";
+import { resolveBrowserApprovalWait, resolveBrowserNoFocus } from "../browser/config.js";
 import { normalizeBrowserModelStrategy } from "../browser/modelStrategy.js";
 import type {
   BrowserArchiveMode,
@@ -33,6 +34,10 @@ const CURRENT_CHATGPT_PRO_ALIASES = new Set([
 // The browser label is passed to the model picker which fuzzy-matches against ChatGPT's UI.
 const BROWSER_MODEL_LABELS: [ModelName, string][] = [
   // Most specific first (e.g., "gpt-5.2-thinking" before "gpt-5.2")
+  // GPT-6 (Astra) is a model radio; GPT-6 Pro selects that radio with Pro power.
+  // The picker also recognizes the legacy Latest labels for older layouts.
+  ["gpt-6-pro", "GPT-6"],
+  ["gpt-6-astra", "GPT-6"],
   ["gpt-5.6-sol", "GPT-5.6 Sol"],
   ["gpt-5.6", "GPT-5.6 Sol"],
   ["gpt-5.5-pro", "GPT-5.5"],
@@ -65,6 +70,7 @@ export interface BrowserFlagOptions {
   browserUrl?: string;
   browserTimeout?: string;
   browserInputTimeout?: string;
+  browserApprovalWait?: string;
   browserAttachmentTimeout?: string;
   browserRecheckDelay?: string;
   browserRecheckTimeout?: string;
@@ -82,6 +88,7 @@ export interface BrowserFlagOptions {
   browserInlineCookies?: string;
   browserHeadless?: boolean;
   browserHideWindow?: boolean;
+  browserNoFocus?: boolean;
   browserKeepBrowser?: boolean;
   browserManualLogin?: boolean;
   browserManualLoginProfileDir?: string | null;
@@ -92,6 +99,7 @@ export interface BrowserFlagOptions {
   browserThinkingTime?: ThinkingTimeLevel;
   browserResearch?: BrowserResearchMode;
   browserArchive?: BrowserArchiveMode;
+  browserCaptureProviderNative?: boolean;
   browserModelLabel?: string;
   /** Original model request before browser alias normalization. */
   browserRequestedModel?: ModelName;
@@ -106,6 +114,13 @@ export interface BrowserFlagOptions {
 
 export function normalizeChatGptModelForBrowser(model: ModelName): ModelName {
   const normalized = model.toLowerCase() as ModelName;
+  // Browser-only alias: gpt-6-pro keeps its name so the Pro tier default survives (label "GPT-6").
+  if (isGpt6ProAlias(normalized)) {
+    return "gpt-6-pro" as ModelName;
+  }
+  if (isGpt6Alias(normalized)) {
+    return "gpt-6-astra";
+  }
   if (!normalized.startsWith("gpt-") || normalized.includes("codex")) {
     return model;
   }
@@ -139,6 +154,21 @@ export function normalizeChatGptModelForBrowser(model: ModelName): ModelName {
   return model;
 }
 
+// Documented spellings only: gpt-6, gpt-6-astra, gpt-6-pro (plus their label forms such as
+// "GPT-6 Pro") and "latest" map to ChatGPT's "GPT-6" model. Any other gpt-6-* id (gpt-6-codex,
+// gpt-6-custom, ...) is not an alias and must pass through unchanged for custom/OpenRouter use.
+const GPT6_ALIAS_PATTERN = /^gpt[-_ ]?6(?:[-_ ](?:astra|pro))?$/;
+const GPT6_PRO_ALIAS_PATTERN = /^gpt[-_ ]?6[-_ ]pro$/;
+
+export function isGpt6Alias(model: string | undefined): boolean {
+  const normalized = model?.trim().toLowerCase() ?? "";
+  return normalized === "latest" || GPT6_ALIAS_PATTERN.test(normalized);
+}
+
+export function isGpt6ProAlias(model: string | undefined): boolean {
+  return GPT6_PRO_ALIAS_PATTERN.test(model?.trim().toLowerCase() ?? "");
+}
+
 export function isCurrentChatGptProAlias(model: string | undefined): boolean {
   return CURRENT_CHATGPT_PRO_ALIASES.has(model?.trim().toLowerCase() ?? "");
 }
@@ -155,7 +185,10 @@ export function resolveDefaultBrowserThinkingTime({
   const strategy = normalizeBrowserModelStrategy(modelStrategy) ?? DEFAULT_MODEL_STRATEGY;
   if (strategy !== "select") return undefined;
   const normalizedModel = normalizeChatGptModelForBrowser(model as ModelName);
-  return isCurrentChatGptProAlias(requestedModel ?? model) || normalizedModel === "gpt-5.5-pro"
+  return isCurrentChatGptProAlias(requestedModel ?? model) ||
+    isGpt6ProAlias(requestedModel ?? model) ||
+    normalizedModel === "gpt-6-pro" ||
+    normalizedModel === "gpt-5.5-pro"
     ? "pro"
     : undefined;
 }
@@ -257,6 +290,7 @@ export async function buildBrowserConfig(
           DEFAULT_BROWSER_INPUT_TIMEOUT_MS,
         )
       : undefined,
+    approvalWaitMs: resolveBrowserApprovalWait(options.browserApprovalWait),
     attachmentTimeoutMs: options.browserAttachmentTimeout
       ? parseBrowserDuration(
           options.browserAttachmentTimeout,
@@ -318,6 +352,9 @@ export async function buildBrowserConfig(
     manualLoginCookieSync: inline?.cookies?.length ? true : options.browserManualLoginCookieSync,
     copyProfileSource: options.copyProfile ?? undefined,
     hideWindow: options.browserHideWindow ? true : undefined,
+    // Save what the run uses, so recovery and reattach later follow this run's setting rather
+    // than whatever the default is by then. An explicit false still opts out.
+    noFocus: resolveBrowserNoFocus({ noFocus: options.browserNoFocus }),
     desiredModel,
     modelStrategy,
     debug: options.verbose ? true : undefined,
@@ -326,8 +363,12 @@ export async function buildBrowserConfig(
     remoteChrome,
     browserTabRef: options.browserTab ?? undefined,
     thinkingTime,
-    researchMode: options.browserResearch === "deep" ? "deep" : "off",
+    researchMode:
+      options.browserResearch === "deep" || options.browserResearch === "search"
+        ? options.browserResearch
+        : "off",
     archiveConversations: options.browserArchive,
+    captureProviderNative: options.browserCaptureProviderNative,
   };
 }
 
@@ -429,13 +470,17 @@ export function resolveBrowserModelLabel(input: string | undefined, model: Model
     return mapModelToBrowserLabel(model);
   }
   const normalizedInput = trimmed.toLowerCase();
-  if (normalizedInput === model.toLowerCase()) {
+  if (
+    normalizedInput === model.toLowerCase() ||
+    (isGpt6Alias(normalizedInput) && (model === "gpt-6-astra" || model === "gpt-6-pro")) ||
+    (isGpt6ProAlias(normalizedInput) && model === "gpt-6-pro")
+  ) {
     return mapModelToBrowserLabel(model);
   }
   return trimmed;
 }
 
-function parseRemoteChromeTarget(raw: string): { host: string; port: number } {
+export function parseRemoteChromeTarget(raw: string): { host: string; port: number } {
   const target = raw.trim();
   if (!target) {
     throw new Error(

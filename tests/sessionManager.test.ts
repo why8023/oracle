@@ -11,6 +11,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { setOracleHomeDirOverrideForTest } from "../src/oracleHome.js";
@@ -134,6 +135,17 @@ describe("session identifiers", () => {
 });
 
 describe("session lifecycle", () => {
+  test("new browser sessions cannot be mistaken for legacy sessions before submission", async () => {
+    const metadata = await sessionModule.initializeSession(
+      { prompt: "Pending browser prompt", model: "gpt-5.5", mode: "browser" },
+      "/tmp/cwd",
+    );
+    const stored = JSON.parse(
+      await readFile(path.join(sessionModule.getSessionsDir(), metadata.id, "meta.json"), "utf8"),
+    );
+    expect(stored.browser.runtime.submittedPromptHash).toBeNull();
+  });
+
   test("initializeSession writes metadata, request, and log files", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2025-04-01T00:00:00Z"));
@@ -225,6 +237,35 @@ describe("session lifecycle", () => {
     const updated = await sessionModule.readSessionMetadata(meta.id);
     expect(updated?.status).toBe("complete");
     expect(updated?.promptPreview).toBe("value");
+    const sessionFiles = await readdir(path.join(sessionModule.getSessionsDir(), meta.id));
+    expect(sessionFiles.filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  test("retries transient metadata rename failures without leaving temporary files", async () => {
+    const meta = await sessionModule.initializeSession(
+      { prompt: "Retry metadata rename", model: "gpt-5.2-pro" },
+      "/tmp/cwd",
+    );
+    const originalRename = fs.rename.bind(fs);
+    let attempts = 0;
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (source, target) => {
+      attempts += 1;
+      if (attempts <= 2) {
+        throw Object.assign(new Error("transient Windows metadata lock"), { code: "EPERM" });
+      }
+      return originalRename(source, target);
+    });
+
+    try {
+      await sessionModule.updateSessionMetadata(meta.id, { promptPreview: "retry succeeded" });
+    } finally {
+      renameSpy.mockRestore();
+    }
+
+    expect(attempts).toBe(3);
+    expect((await sessionModule.readSessionMetadata(meta.id))?.promptPreview).toBe(
+      "retry succeeded",
+    );
     const sessionFiles = await readdir(path.join(sessionModule.getSessionsDir(), meta.id));
     expect(sessionFiles.filter((name) => name.endsWith(".tmp"))).toEqual([]);
   });
@@ -484,6 +525,67 @@ describe("session listing and filtering", () => {
     expect(limited.truncated).toBe(true);
     expect(limited.total).toBe(2);
     vi.useRealTimers();
+  });
+
+  test("listSessionsMetadata keeps newest-first order when a session has no createdAt", async () => {
+    const writeMeta = async (id: string, fields: Record<string, unknown>) => {
+      const dir = path.join(sessionModule.getSessionsDir(), id);
+      await mkdir(dir, { recursive: true });
+      await writeFile(
+        path.join(dir, "meta.json"),
+        JSON.stringify({ id, status: "completed", options: {}, ...fields }),
+      );
+    };
+    for (const [id, createdAt] of [
+      ["a-day-3", "2026-06-03T00:00:00.000Z"],
+      ["b-day-6", "2026-06-06T00:00:00.000Z"],
+      ["c-day-1", "2026-06-01T00:00:00.000Z"],
+      ["e-day-5", "2026-06-05T00:00:00.000Z"],
+      ["f-day-2", "2026-06-02T00:00:00.000Z"],
+    ]) {
+      await writeMeta(id, { createdAt });
+    }
+    // Shape seen in real ~/.oracle/sessions: no createdAt, startedAt null, completedAt set.
+    await writeMeta("d-completed-day-4", {
+      startedAt: null,
+      completedAt: "2026-06-04T00:00:00.000Z",
+    });
+    await writeMeta("g-started-day-7", {
+      createdAt: "not a date",
+      startedAt: "2026-06-07T00:00:00.000Z",
+    });
+    await writeMeta("0-no-timestamps", {});
+    // Precedence: a valid createdAt wins over later startedAt/completedAt, then startedAt over completedAt.
+    await writeMeta("h-created-day-2.5", {
+      createdAt: "2026-06-02T12:00:00.000Z",
+      startedAt: "2026-06-08T00:00:00.000Z",
+      completedAt: "2026-06-09T00:00:00.000Z",
+    });
+    await writeMeta("i-started-day-3.5", {
+      createdAt: "not a date",
+      startedAt: "2026-06-03T12:00:00.000Z",
+      completedAt: "2026-06-10T00:00:00.000Z",
+    });
+    await writeMeta("j-completed-day-1.5", {
+      createdAt: "not a date",
+      startedAt: "also not a date",
+      completedAt: "2026-06-01T12:00:00.000Z",
+    });
+
+    const metas = await sessionModule.listSessionsMetadata();
+    expect(metas.map((meta) => meta.id)).toEqual([
+      "g-started-day-7",
+      "b-day-6",
+      "e-day-5",
+      "d-completed-day-4",
+      "i-started-day-3.5",
+      "a-day-3",
+      "h-created-day-2.5",
+      "f-day-2",
+      "j-completed-day-1.5",
+      "c-day-1",
+      "0-no-timestamps",
+    ]);
   });
 
   test("deleteSessionsOlderThan removes only sessions past the cutoff", async () => {

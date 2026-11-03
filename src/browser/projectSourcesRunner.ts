@@ -4,6 +4,7 @@ import path from "node:path";
 import type { LaunchedChrome } from "chrome-launcher";
 import {
   closeTab,
+  ensureChromePageTargetAfterClose,
   connectWithNewTab,
   launchChrome,
   positionChromeWindowOffscreen,
@@ -11,6 +12,12 @@ import {
   registerTerminationHooks,
 } from "./chromeLifecycle.js";
 import { resolveBrowserConfig } from "./config.js";
+import {
+  bringChromeForwardForUser,
+  enableFocusEmulation,
+  shouldActivateBeforeTrustedInput,
+} from "./focusEmulation.js";
+import { maybeReuseRunningChrome } from "./reuseChrome.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
 import {
   installJavaScriptDialogAutoDismissal,
@@ -18,19 +25,12 @@ import {
   ensureLoggedIn,
 } from "./pageActions.js";
 import type { BrowserLogger, ChromeClient, ResolvedBrowserConfig } from "./types.js";
-import {
-  acquireBrowserTabLease,
-  hasOtherActiveBrowserTabLeases,
-  type BrowserTabLease,
-} from "./tabLeaseRegistry.js";
+import { acquireBrowserTabLease, type BrowserTabLease } from "./tabLeaseRegistry.js";
 import {
   acquireProfileRunLock,
   cleanupStaleProfileState,
-  findRunningChromeDebugTargetForProfile,
-  readChromePid,
-  readDevToolsPort,
   shouldCleanupManualLoginProfileState,
-  verifyDevToolsReachable,
+  terminateRecordedChromeForProfile,
   writeChromePid,
   writeDevToolsActivePort,
   type ProfileRunLock,
@@ -55,6 +55,75 @@ import type { ProjectSourcesRequest, ProjectSourcesResult } from "../projectSour
 import { CHROME_COOKIE_SYNC_WARNING, shouldSyncBrowserCookies } from "./policies.js";
 
 type BrowserChrome = LaunchedChrome & { host?: string };
+
+async function releaseProjectSourcesBrowserTabLease(options: {
+  lease: BrowserTabLease;
+  terminateSharedChrome?: () => Promise<boolean>;
+  chromePid?: number;
+  chromePort?: number;
+  logger: BrowserLogger;
+}): Promise<{
+  keepBrowserOpen: boolean;
+  terminationHandled: boolean;
+  releaseError?: Error;
+}> {
+  let decisionObserved = false;
+  let keepBrowserOpen = false;
+  let terminationHandled = false;
+  let otherLeasesRemain = false;
+  let releaseError: Error | undefined;
+  try {
+    await options.lease.release({
+      onRelease: async ({ isLastLease }) => {
+        decisionObserved = true;
+        if (!isLastLease) {
+          keepBrowserOpen = true;
+          otherLeasesRemain = true;
+          return;
+        }
+        if (!options.terminateSharedChrome) return;
+        options.logger(
+          `[browser] ChatGPT browser slot ${options.lease.id.slice(0, 8)} is final; ` +
+            `terminating shared Chrome (session=project-sources; controllerPid=${process.pid}; ` +
+            `chromePid=${options.chromePid ?? "unknown"}; chromePort=${options.chromePort ?? "unknown"}).`,
+        );
+        const terminated = await options.terminateSharedChrome().catch(() => false);
+        if (terminated) {
+          terminationHandled = true;
+        } else {
+          keepBrowserOpen = true;
+          options.logger(
+            "[browser] Could not verify shared Chrome termination; leaving it available for reuse.",
+          );
+        }
+      },
+    });
+  } catch (error) {
+    releaseError = error instanceof Error ? error : new Error(String(error));
+    if (!terminationHandled) keepBrowserOpen = true;
+    options.logger(
+      `[browser] Failed to release the ChatGPT browser slot registry lock; restart Oracle/Codex MCP before another browser run: ${releaseError.message}`,
+    );
+  }
+  if (!decisionObserved) {
+    keepBrowserOpen = true;
+    options.logger(
+      "[browser] Could not verify final ChatGPT tab lease; leaving shared Chrome running.",
+    );
+  } else if (otherLeasesRemain) {
+    options.logger(
+      `[browser] Other ChatGPT tab leases still active; leaving shared Chrome running; ` +
+        `browser slot ${options.lease.id.slice(0, 8)} is non-final ` +
+        `(session=project-sources; controllerPid=${process.pid}; ` +
+        `chromePid=${options.chromePid ?? "unknown"}; chromePort=${options.chromePort ?? "unknown"}).`,
+    );
+  }
+  return {
+    keepBrowserOpen,
+    terminationHandled,
+    ...(releaseError ? { releaseError } : {}),
+  };
+}
 
 export async function runBrowserProjectSources(
   request: ProjectSourcesRequest,
@@ -152,15 +221,18 @@ export async function runBrowserProjectSources(
       {
         isInFlight: () => !completed,
         preserveUserDataDir: manualLogin,
+        preserveSharedChromeOnSignal: manualLogin,
       },
     );
 
     const strictTabIsolation = Boolean(manualLogin && reusedChrome);
     const devtoolsRetries = manualLogin ? 6 : 0;
     const connection = await connectWithNewTab(chrome.port, logger, "about:blank", chromeHost, {
-      fallbackToDefault: !strictTabIsolation,
+      // A no-focus launch has no startup page, so there is no default tab to fall back to.
+      fallbackToDefault: !strictTabIsolation && !(config.noFocus && !config.headless),
       retries: devtoolsRetries,
       retryDelayMs: 500,
+      background: config.noFocus,
     });
     client = connection.client;
     isolatedTargetId = connection.targetId ?? null;
@@ -193,6 +265,14 @@ export async function runBrowserProjectSources(
     } else if (!config.headless) {
       await positionChromeWindowOnscreen(client, userDataDir, logger);
     }
+    // A no-focus tab stays behind other apps, so its trusted clicks need focus emulation.
+    const activateBeforeTrustedInput = config.noFocus
+      ? shouldActivateBeforeTrustedInput(
+          true,
+          await enableFocusEmulation(client, logger, "Project Sources target"),
+          logger,
+        )
+      : false;
     removeDialogHandler = installJavaScriptDialogAutoDismissal(Page, logger);
     if (!manualLogin) {
       await Network.clearBrowserCookies();
@@ -216,9 +296,25 @@ export async function runBrowserProjectSources(
         timeoutMs: config.timeoutMs,
         profileDir: userDataDir,
         keepBrowser: effectiveKeepBrowser,
+        // Sign-in needs the user, so a no-focus run brings Chrome forward for it once.
+        onLoginRequired:
+          config.noFocus && !config.headless
+            ? async () => {
+                // As in the main sign-in wait, a hidden window has to come back on-screen too.
+                if (config.hideWindow && client)
+                  await positionChromeWindowOnscreen(client, userDataDir, logger);
+                await bringChromeForwardForUser(Page, logger, "sign-in");
+              }
+            : undefined,
       }),
     );
     await raceWithDisconnect(navigateToChatGPT(Page, Runtime, projectUrl, logger));
+    if (activateBeforeTrustedInput) {
+      await Page.bringToFront().catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        logger(`[browser] Could not bring Project Sources target to front: ${message}`);
+      });
+    }
     await raceWithDisconnect(openProjectSourcesTab(Runtime, Input, config.inputTimeoutMs, logger));
     await raceWithDisconnect(waitForProjectSourcesReady(Runtime, config.inputTimeoutMs, logger));
 
@@ -260,12 +356,31 @@ export async function runBrowserProjectSources(
       // ignore close failures
     }
     if (completed && isolatedTargetId && chrome?.port) {
-      await closeTab(chrome.port, isolatedTargetId, logger, chromeHost).catch(() => undefined);
+      // A kept Chrome must keep a page, as in the main runner: a no-focus launch has no other one.
+      const safeToClose =
+        !effectiveKeepBrowser ||
+        Boolean(
+          await ensureChromePageTargetAfterClose(
+            chrome.port,
+            isolatedTargetId,
+            logger,
+            chromeHost,
+            { background: config.noFocus },
+          ).catch(() => undefined),
+        );
+      if (safeToClose) {
+        await closeTab(chrome.port, isolatedTargetId, logger, chromeHost).catch(() => undefined);
+      } else {
+        logger(
+          "[browser] Leaving the Project Sources tab open because Chrome has no replacement page target.",
+        );
+      }
     }
 
     let keepBrowserOpen = effectiveKeepBrowser;
     let cleanupProfileLock: ProfileRunLock | null = null;
-    let terminatedRecordedChrome = false;
+    let browserTerminationHandledByLease = false;
+    let tabLeaseReleaseError: Error | undefined;
     if (!keepBrowserOpen && manualLogin && tabLease) {
       const cleanupLockTimeoutMs = Math.max(0, config.profileLockTimeoutMs ?? 0);
       if (cleanupLockTimeoutMs > 0) {
@@ -275,25 +390,30 @@ export async function runBrowserProjectSources(
           sessionId: "project-sources",
         }).catch(() => null);
       }
-      keepBrowserOpen = await hasOtherActiveBrowserTabLeases(userDataDir, tabLease.id).catch(
-        () => false,
-      );
-      if (keepBrowserOpen) {
-        logger("[browser] Other ChatGPT tab leases still active; leaving shared Chrome running.");
-      } else if (reusedChrome && !connectionClosedUnexpectedly) {
-        keepBrowserOpen = true;
-        logger("[browser] Reused shared Chrome; leaving browser process running.");
-      }
     }
     if (tabLease) {
       const handle = tabLease;
       tabLease = null;
-      await handle.release().catch(() => undefined);
+      const chromeHandle = chrome;
+      const terminateSharedChrome =
+        !keepBrowserOpen && manualLogin && chromeHandle && !connectionClosedUnexpectedly
+          ? async () => terminateRecordedChromeForProfile(userDataDir, logger).catch(() => false)
+          : undefined;
+      const releaseResult = await releaseProjectSourcesBrowserTabLease({
+        lease: handle,
+        terminateSharedChrome,
+        chromePid: chromeHandle?.pid,
+        chromePort: chromeHandle?.port,
+        logger,
+      });
+      keepBrowserOpen ||= releaseResult.keepBrowserOpen;
+      browserTerminationHandledByLease = releaseResult.terminationHandled;
+      tabLeaseReleaseError = releaseResult.releaseError;
     }
     if (!keepBrowserOpen && chrome) {
       if (!connectionClosedUnexpectedly) {
         try {
-          if (!terminatedRecordedChrome) {
+          if (!browserTerminationHandledByLease) {
             await chrome.kill();
           }
         } catch {
@@ -324,6 +444,13 @@ export async function runBrowserProjectSources(
     }
     if (cleanupProfileLock) {
       await cleanupProfileLock.release().catch(() => undefined);
+    }
+    if (tabLeaseReleaseError) {
+      // oxlint-disable-next-line eslint/no-unsafe-finally -- This cleanup failure must override a successful Project Sources result or a live MCP owner can remain locked.
+      throw new Error(
+        "Failed to release the ChatGPT browser slot registry lock; restart Oracle/Codex MCP before another browser run.",
+        { cause: tabLeaseReleaseError },
+      );
     }
   }
 }
@@ -376,6 +503,7 @@ async function waitForProjectSourcesLogin({
   timeoutMs,
   profileDir,
   keepBrowser,
+  onLoginRequired,
 }: {
   runtime: ChromeClient["Runtime"];
   logger: BrowserLogger;
@@ -384,6 +512,7 @@ async function waitForProjectSourcesLogin({
   timeoutMs: number;
   profileDir?: string;
   keepBrowser?: boolean;
+  onLoginRequired?: () => Promise<void>;
 }): Promise<void> {
   if (!manualLogin) {
     await ensureLoggedIn(runtime, logger, { appliedCookies });
@@ -392,6 +521,7 @@ async function waitForProjectSourcesLogin({
   const waitMs = resolveManualLoginWaitMs(timeoutMs, Boolean(keepBrowser));
   const deadline = Date.now() + waitMs;
   let lastNotice = 0;
+  let loginWindowShown = false;
   while (Date.now() < deadline) {
     try {
       await ensureLoggedIn(runtime, logger, { appliedCookies });
@@ -403,6 +533,10 @@ async function waitForProjectSourcesLogin({
         message.toLowerCase().includes("session not detected");
       if (!retryable) {
         throw error;
+      }
+      if (!loginWindowShown) {
+        loginWindowShown = true;
+        await onLoginRequired?.();
       }
       const now = Date.now();
       if (now - lastNotice > 5000) {
@@ -437,8 +571,9 @@ async function acquireManualLoginChromeForProjectSources(
     });
   }
   try {
-    const reusedChrome = await maybeReuseProjectSourcesChrome(userDataDir, logger, {
+    const reusedChrome = await maybeReuseRunningChrome(userDataDir, logger, {
       waitForPortMs: config.reuseChromeWaitMs,
+      chromePath: config.chromePath,
     });
     const chrome =
       reusedChrome ??
@@ -462,75 +597,4 @@ async function acquireManualLoginChromeForProjectSources(
   }
 }
 
-async function maybeReuseProjectSourcesChrome(
-  userDataDir: string,
-  logger: BrowserLogger,
-  options: { waitForPortMs?: number; probe?: typeof verifyDevToolsReachable } = {},
-): Promise<LaunchedChrome | null> {
-  const waitForPortMs = Math.max(0, options.waitForPortMs ?? 0);
-  let port = await readDevToolsPort(userDataDir);
-  if (!port && waitForPortMs > 0) {
-    const deadline = Date.now() + waitForPortMs;
-    logger(`Waiting up to ${Math.round(waitForPortMs / 1000)}s for shared Chrome to appear...`);
-    while (!port && Date.now() < deadline) {
-      await delay(250);
-      port = await readDevToolsPort(userDataDir);
-    }
-  }
-  let pid = await readChromePid(userDataDir);
-  if (!port) {
-    const discovered = await findRunningChromeDebugTargetForProfile(userDataDir);
-    if (!discovered) {
-      if (pid) {
-        logger(
-          `No reachable Chrome DevTools target found for ${userDataDir}; clearing stale profile state before launching new Chrome.`,
-        );
-        await cleanupStaleProfileState(userDataDir, logger, {
-          lockRemovalMode: "if_oracle_pid_dead",
-        });
-      }
-      return null;
-    }
-    const probe = await (options.probe ?? verifyDevToolsReachable)({ port: discovered.port });
-    if (!probe.ok) {
-      logger(
-        `Discovered Chrome for ${userDataDir} on port ${discovered.port} but it was unreachable (${probe.error}); launching new Chrome.`,
-      );
-      await cleanupStaleProfileState(userDataDir, logger, {
-        lockRemovalMode: "if_oracle_pid_dead",
-      });
-      return null;
-    }
-    await writeDevToolsActivePort(userDataDir, discovered.port);
-    await writeChromePid(userDataDir, discovered.pid);
-    port = discovered.port;
-    pid = discovered.pid;
-    logger(
-      `Discovered running Chrome for ${userDataDir}; reusing (DevTools port ${port}, pid ${pid})`,
-    );
-    return { port, pid, kill: async () => {}, process: undefined } as unknown as LaunchedChrome;
-  }
-  const probe = await (options.probe ?? verifyDevToolsReachable)({ port });
-  if (!probe.ok) {
-    logger(
-      `Recorded Chrome DevTools port ${port} is stale (${probe.error}); launching new Chrome.`,
-    );
-    await cleanupStaleProfileState(userDataDir, logger, { lockRemovalMode: "if_oracle_pid_dead" });
-    return null;
-  }
-  logger(`Reusing running Chrome on port ${port} with profile ${userDataDir}`);
-  return {
-    port,
-    pid: pid ?? undefined,
-    kill: async () => {},
-    process: undefined,
-  } as unknown as LaunchedChrome;
-}
-
-export async function maybeReuseProjectSourcesChromeForTest(
-  userDataDir: string,
-  logger: BrowserLogger,
-  options: { waitForPortMs?: number; probe?: typeof verifyDevToolsReachable } = {},
-): Promise<LaunchedChrome | null> {
-  return maybeReuseProjectSourcesChrome(userDataDir, logger, options);
-}
+export const releaseProjectSourcesBrowserTabLeaseForTest = releaseProjectSourcesBrowserTabLease;

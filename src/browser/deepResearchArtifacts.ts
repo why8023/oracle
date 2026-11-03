@@ -19,6 +19,7 @@ export async function saveDeepResearchRunArtifacts(params: {
   result: DeepResearchCompletionResult;
   conversationUrl?: string;
   logger: BrowserLogger;
+  additionalArtifacts?: SessionArtifact[];
 }): Promise<SessionArtifact[] | undefined> {
   const reportArtifact = await saveOptionalDeepResearchArtifact(
     () =>
@@ -40,6 +41,10 @@ export async function saveDeepResearchRunArtifacts(params: {
     appendArtifacts(undefined, [reportArtifact]),
     comparisonArtifacts ?? [],
   );
+  const artifactsWithProviderCapture = appendArtifacts(
+    researchArtifacts,
+    params.additionalArtifacts ?? [],
+  );
   const transcriptArtifact = await saveOptionalDeepResearchArtifact(
     () =>
       saveBrowserTranscriptArtifact({
@@ -47,12 +52,12 @@ export async function saveDeepResearchRunArtifacts(params: {
         prompt: params.prompt,
         answerMarkdown: params.result.text,
         conversationUrl: params.conversationUrl,
-        artifacts: researchArtifacts,
+        artifacts: artifactsWithProviderCapture,
         logger: params.logger,
       }),
     params.logger,
   );
-  return appendArtifacts(researchArtifacts, [transcriptArtifact]);
+  return appendArtifacts(artifactsWithProviderCapture, [transcriptArtifact]);
 }
 
 export function hasSavedDeepResearchRunArtifacts(

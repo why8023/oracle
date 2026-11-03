@@ -19,6 +19,7 @@ export interface NotifyConfig {
 }
 
 export interface BrowserConfigDefaults {
+  remoteChrome?: { host: string; port: number } | null;
   chromeProfile?: string | null;
   chromePath?: string | null;
   chromeCookiePath?: string | null;
@@ -34,6 +35,8 @@ export interface BrowserConfigDefaults {
   timeoutMs?: number;
   debugPort?: number | null;
   inputTimeoutMs?: number;
+  /** Time budget for each Chrome remote-debugging approval prompt. */
+  approvalWaitMs?: number;
   /** Time budget for attachment upload/readiness before clicking send. */
   attachmentTimeoutMs?: number;
   /** Delay before rechecking the conversation after an assistant timeout. */
@@ -57,6 +60,8 @@ export interface BrowserConfigDefaults {
   cookieSyncWaitMs?: number;
   headless?: boolean;
   hideWindow?: boolean;
+  /** Keep the automation Chrome in the background during ordinary runs (--browser-no-focus). */
+  noFocus?: boolean;
   keepBrowser?: boolean;
   modelStrategy?: BrowserModelStrategy;
   /** Thinking time intensity (ChatGPT Thinking/Pro models): 'light', 'standard', 'extended', 'heavy' */
@@ -71,6 +76,13 @@ export interface BrowserConfigDefaults {
   manualLoginProfileDir?: string | null;
   /** Seed a manual-login profile from configured Chrome/inline cookies. */
   manualLoginCookieSync?: boolean;
+  /**
+   * Also fetch ChatGPT's own conversation document and an independent set of
+   * per-turn digests, saved beside the run's other artifacts. Off by default:
+   * it costs two extra authenticated requests and only matters when the
+   * transcript is meant to be evidence rather than an answer.
+   */
+  captureProviderNative?: boolean;
 }
 
 export interface AzureConfig {
@@ -280,10 +292,12 @@ function sanitizeProjectConfig(config: UserConfig): UserConfig {
   if (config.browser) {
     sanitized.browser = {};
     const browser = config.browser;
+    // Full-conversation retention is user-owned; never allow captureProviderNative here.
     const allowedBrowserKeys: Array<keyof BrowserConfigDefaults> = [
       "attachRunning",
       "timeoutMs",
       "inputTimeoutMs",
+      "approvalWaitMs",
       "attachmentTimeoutMs",
       "assistantRecheckDelayMs",
       "assistantRecheckTimeoutMs",
@@ -295,6 +309,7 @@ function sanitizeProjectConfig(config: UserConfig): UserConfig {
       "autoReattachTimeoutMs",
       "cookieSyncWaitMs",
       "hideWindow",
+      "noFocus",
       "keepBrowser",
       "modelStrategy",
       "thinkingTime",

@@ -83,6 +83,78 @@ describe("browser thinking-time selection expression", () => {
     expect(expression).toContain("'思考量'");
   });
 
+  // Scope each inventory to its own list: "erweitert" belongs to both the
+  // extended tier and the Advanced menu, so whole-expression checks miss removals.
+  it("keeps every LEVEL_TOKENS locale word for every tier", () => {
+    const levelWords: Record<Exclude<ThinkingTimeLevel, "pro">, string[]> = {
+      light: ["light", "instant", "sofort", "leicht", "最速", "轻", "极速", "즉시"],
+      standard: ["standard", "medium", "mittel", "中程度", "标准", "中", "중간"],
+      extended: [
+        "extended",
+        "high",
+        "hoch",
+        "erweitert",
+        "高い",
+        "扩展",
+        "深度",
+        "加强",
+        "高",
+        "높음",
+      ],
+      "extra-high": ["extra high", "sehr hoch", "非常に高い", "极高", "매우 높음"],
+      heavy: ["heavy", "schwer", "重度", "加重"],
+    };
+    for (const [level, words] of Object.entries(levelWords)) {
+      const expression = buildThinkingTimeExpressionForTest(level as ThinkingTimeLevel);
+      const levelTokens = expression.match(/const LEVEL_TOKENS = \{([\s\S]*?)\};/)?.[1];
+      const tierWords = levelTokens?.match(
+        new RegExp(`(?:'${level}'|${level}): \\[([^\\]]*)\\]`),
+      )?.[1];
+      for (const word of words) {
+        expect(tierWords, `${level} should still list '${word}'`).toContain(`'${word}'`);
+      }
+    }
+  });
+
+  it("keeps every EFFORT_WORDS locale word", () => {
+    const expression = buildThinkingTimeExpressionForTest();
+    const effortWords = expression.match(/const EFFORT_WORDS = \[([\s\S]*?)\];/)?.[1];
+    for (const word of [
+      "effort",
+      "aufwand",
+      "强度",
+      "努力",
+      "推論レベル",
+      "思考量",
+      "추론 수준",
+      "esfuerzo",
+      "esforco",
+      "sforzo",
+      "inspanning",
+      "wysilek",
+    ]) {
+      expect(effortWords, `EFFORT_WORDS should still list '${word}'`).toContain(`'${word}'`);
+    }
+  });
+
+  it("keeps every ADVANCED_WORDS locale word", () => {
+    const expression = buildThinkingTimeExpressionForTest();
+    const advancedWords = expression.match(/const ADVANCED_WORDS = \[([\s\S]*?)\];/)?.[1];
+    for (const word of [
+      "advanced",
+      "erweitert",
+      "高级",
+      "詳細設定",
+      "詳細表示",
+      "고급",
+      "avanzado",
+      "avancado",
+      "avance",
+    ]) {
+      expect(advancedWords, `ADVANCED_WORDS should still list '${word}'`).toContain(`'${word}'`);
+    }
+  });
+
   it("infers target model kind with token matching", () => {
     expect(inferThinkingTargetModelKindForTest("gpt-5.5-pro")).toBe("pro");
     expect(inferThinkingTargetModelKindForTest("Thinking 5.5")).toBe("thinking");
@@ -328,6 +400,8 @@ describe("browser thinking-time selection expression", () => {
     };
     const logs: string[] = [];
 
+    // Best-effort resolution still yields an evidence record, but one that
+    // refuses to claim the tier was confirmed.
     await expect(
       ensureThinkingTime(
         runtime as never,
@@ -335,7 +409,13 @@ describe("browser thinking-time selection expression", () => {
         ((message: string) => logs.push(message)) as never,
         null,
       ),
-    ).resolves.toBeUndefined();
+    ).resolves.toMatchObject({
+      requestedLevel: "extended",
+      status: "unverified",
+      verified: false,
+      strictFailClosed: false,
+      source: "chatgpt-thinking-picker",
+    });
 
     expect(logs.at(-1)).toContain("keeping the effort already selected in ChatGPT");
   });
@@ -2754,18 +2834,50 @@ describe("unified Intelligence picker with Advanced -> Effort submenu", () => {
       return this.attrs[name] ?? null;
     }
 
+    get id(): string {
+      return this.attrs.id ?? "";
+    }
+
     setAttribute(name: string, value: string): void {
       this.attrs[name] = value;
     }
 
     private matchesSelector(selector: string): boolean {
+      if (selector.includes(",")) {
+        return selector.split(",").some((part) => this.matchesSelector(part.trim()));
+      }
       const role = this.attrs.role ?? "";
       const testid = this.attrs["data-testid"] ?? "";
       if (selector === '[data-model-selection-view="true"]') {
         return this.attrs["data-model-selection-view"] === "true";
       }
+      if (selector === '[data-model-picker-view="simple"]') {
+        return this.attrs["data-model-picker-view"] === "simple";
+      }
+      if (selector === "[data-model-picker-power-slider]") {
+        return this.attrs["data-model-picker-power-slider"] !== undefined;
+      }
+      if (selector.includes('[data-model-picker-view="simple"] [data-reasoning-slider="true"]')) {
+        return this.attrs["data-reasoning-slider"] === "true";
+      }
+      if (
+        selector.includes('[data-model-picker-view] [role="menuitemradio"][aria-checked="true"]')
+      ) {
+        return role === "menuitemradio" && this.attrs["aria-checked"] === "true";
+      }
       if (selector === "[data-model-reasoning-effort-slider]") {
         return this.attrs["data-model-reasoning-effort-slider"] !== undefined;
+      }
+      if (selector === "[data-reasoning-slider]")
+        return this.attrs["data-reasoning-slider"] !== undefined;
+      if (selector === '[data-reasoning-slider="true"]') {
+        return this.attrs["data-reasoning-slider"] === "true";
+      }
+      if (selector === '[data-reasoning-slider] [role="slider"]') {
+        return (
+          this.attrs["data-reasoning-slider"] !== undefined &&
+          this.querySelector('[role="slider"]') !== null
+        );
       }
       if (selector.includes("composer-model-picker-slider-simple-view")) {
         return testid === "composer-model-picker-slider-simple-view";
@@ -2799,11 +2911,14 @@ describe("unified Intelligence picker with Advanced -> Effort submenu", () => {
       return this.descendants().filter((node) => node.matchesSelector(selector));
     }
 
-    closest(_selector: string): Node | null {
-      return null;
+    closest(selector: string): Node | null {
+      return this.matchesSelector(selector) ? this : null;
     }
 
     matches(selector: string): boolean {
+      if (selector.includes("data-codex-intelligence-trigger")) {
+        return this.attrs["data-codex-intelligence-trigger"] === "true";
+      }
       if (selector.includes("__composer-pill")) {
         return (this.attrs.class ?? "").includes("__composer-pill");
       }
@@ -2938,6 +3053,7 @@ describe("unified Intelligence picker with Advanced -> Effort submenu", () => {
     return {
       documentStub,
       pickerContent,
+      pill,
       advancedToggle,
       effortOpener,
       modelOpener,
@@ -2982,6 +3098,7 @@ describe("unified Intelligence picker with Advanced -> Effort submenu", () => {
   function buildDirectSlider(
     currentIndex: number,
     labels = ["Instant", "Medium", "High", "Extra High", "Pro"],
+    maximum = 4,
   ) {
     const dom = buildDom(labels[currentIndex]!);
     const announcement = new Node(`${labels[currentIndex]}, ${currentIndex + 1} of 5.`);
@@ -2989,7 +3106,7 @@ describe("unified Intelligence picker with Advanced -> Effort submenu", () => {
       role: "slider",
       "aria-hidden": "true",
       "aria-valuemin": "0",
-      "aria-valuemax": "4",
+      "aria-valuemax": String(maximum),
       "aria-valuenow": String(currentIndex),
     });
     const slider = new Node("", { "data-model-reasoning-effort-slider": "" }, [thumb]);
@@ -3008,7 +3125,7 @@ describe("unified Intelligence picker with Advanced -> Effort submenu", () => {
       const key = (event as { key?: string }).key;
       if (key !== "ArrowLeft" && key !== "ArrowRight") return true;
       keys.push(key);
-      currentIndex = Math.max(0, Math.min(4, currentIndex + (key === "ArrowRight" ? 1 : -1)));
+      currentIndex = Math.max(0, Math.min(maximum, currentIndex + (key === "ArrowRight" ? 1 : -1)));
       thumb.setAttribute("aria-valuenow", String(currentIndex));
       announcement.textContent = `${labels[currentIndex]}, ${currentIndex + 1} of 5.`;
       return true;
@@ -3024,6 +3141,261 @@ describe("unified Intelligence picker with Advanced -> Effort submenu", () => {
       id === "slider-announcement" ? announcement : null;
     return { ...dom, thumb, announcement, control, simple, keys };
   }
+
+  function buildCurrentAstraPicker(
+    currentIndex: number,
+    checkedModel = "GPT-6",
+    modelLabel = "GPT-6",
+  ) {
+    const dom = buildDirectSlider(currentIndex);
+    const trigger = new Node("Thinking effortThinking effort", {
+      id: "current-model-trigger",
+      "data-codex-intelligence-trigger": "true",
+      "aria-haspopup": "menu",
+      "aria-expanded": "true",
+    });
+    const simple = new Node("", { "data-model-picker-view": "simple" }, [dom.control]);
+    const astra = new Node(modelLabel, {
+      role: "menuitemradio",
+      "aria-checked": checkedModel === modelLabel ? "true" : "false",
+    });
+    const sol = new Node("GPT-5.6 Sol", {
+      role: "menuitemradio",
+      "aria-checked": checkedModel === "GPT-5.6 Sol" ? "true" : "false",
+    });
+    const menu = new Node("6 Pro", { role: "menu", "aria-labelledby": trigger.id }, [
+      simple,
+      astra,
+      sol,
+    ]);
+    const documentStub = {
+      body: new Node(""),
+      getElementById: (id: string) => (id === "slider-announcement" ? dom.announcement : null),
+      querySelector: (selector: string) =>
+        selector.includes("data-codex-intelligence-trigger") ? trigger : null,
+      querySelectorAll: (selector: string) =>
+        selector.includes('role="menu"') || selector.includes("data-radix") ? [menu] : [],
+      dispatchEvent: () => true,
+    };
+    // Current ChatGPT names its slider container differently from the older
+    // direct-slider layout while keeping the same numeric thumb proof.
+    dom.control.setAttribute("data-reasoning-slider", "true");
+    dom.control.children.splice(0, dom.control.children.length);
+    const currentSlider = new Node("", { "data-model-picker-power-slider": "" }, [dom.thumb]);
+    currentSlider.closest = () => dom.control;
+    dom.control.children.push(currentSlider);
+    return { ...dom, documentStub, trigger, menu };
+  }
+
+  it("verifies the current GPT-6 Pro picker from GPT-6 radio and Pro slider", async () => {
+    const dom = buildCurrentAstraPicker(4);
+    await expect(run(dom.documentStub, "pro", "GPT-6")).resolves.toEqual({
+      status: "already-selected",
+      label: "Pro",
+    });
+    expect(dom.thumb.getAttribute("aria-valuenow")).toBe("4");
+    expect(dom.keys).toHaveLength(0);
+  });
+
+  it("moves the current GPT-6 slider to Pro and rejects a checked Sol radio", async () => {
+    const medium = buildCurrentAstraPicker(1);
+    await expect(run(medium.documentStub, "pro", "GPT-6")).resolves.toEqual({
+      status: "switched",
+      label: "Pro",
+    });
+    expect(medium.thumb.getAttribute("aria-valuenow")).toBe("4");
+    expect(medium.keys).toContain("ArrowRight");
+
+    const wrongModel = buildCurrentAstraPicker(4, "GPT-5.6 Sol");
+    await expect(run(wrongModel.documentStub, "pro", "GPT-6")).resolves.toMatchObject({
+      status: "selection-unverified",
+    });
+    expect(wrongModel.keys).toHaveLength(0);
+  });
+
+  it.each(["Latest", "最新", "최신", "최신".normalize("NFD")])(
+    "verifies Pro with the legacy %s radio",
+    async (label) => {
+      const dom = buildCurrentAstraPicker(4, label, label);
+      await expect(run(dom.documentStub, "pro", "GPT-6")).resolves.toEqual({
+        status: "already-selected",
+        label: "Pro",
+      });
+      expect(dom.keys).toHaveLength(0);
+    },
+  );
+
+  it("preserves a saved Latest target with the GPT-6 radio", async () => {
+    const dom = buildCurrentAstraPicker(4);
+    await expect(run(dom.documentStub, "pro", "Latest")).resolves.toEqual({
+      status: "already-selected",
+      label: "Pro",
+    });
+  });
+
+  it("verifies Extra High already selected on the four-tier slider", async () => {
+    const dom = buildDirectSlider(3, undefined, 3);
+    dom.announcement.textContent = "Extra High, 4 of 4";
+    await expect(run(dom.documentStub, "extra-high", "GPT-6")).resolves.toEqual({
+      status: "already-selected",
+      label: "Extra High",
+    });
+    expect(dom.keys).toEqual([]);
+  });
+
+  function useSemanticSlider(dom: ReturnType<typeof buildDirectSlider>) {
+    // The Chat/Work menu owns the slider directly, without the legacy view/test ids.
+    dom.control.setAttribute("data-reasoning-slider", "");
+    dom.control.children.splice(0, dom.control.children.length, dom.thumb);
+    dom.control.closest = () => dom.control;
+    const wrapper = new Node("", {}, [dom.control]);
+    Object.defineProperty(dom.control, "parentElement", { get: () => wrapper });
+    dom.pickerContent.children.splice(0, dom.pickerContent.children.length, wrapper);
+    dom.pill.setAttribute("aria-label", "Select ChatGPT model");
+    dom.pill.closest = () => new Node("", { "data-chatgpt-composer": "" });
+    const querySelectorAll = dom.documentStub.querySelectorAll;
+    dom.documentStub.querySelectorAll = (selector: string) =>
+      selector.includes("Select ChatGPT model") ? [dom.pill] : querySelectorAll(selector);
+    return dom;
+  }
+
+  it("selects Pro on the semantic Chat/Work reasoning slider", async () => {
+    const dom = useSemanticSlider(buildDirectSlider(1));
+    await expect(run(dom.documentStub, "pro", "GPT-6")).resolves.toEqual({
+      status: "switched",
+      label: "Pro",
+    });
+    expect(dom.keys).toEqual(["ArrowRight", "ArrowRight", "ArrowRight"]);
+  });
+
+  it("verifies already-selected Pro on the semantic five-tier slider", async () => {
+    const dom = useSemanticSlider(buildDirectSlider(4));
+    await expect(run(dom.documentStub, "pro", "GPT-6")).resolves.toEqual({
+      status: "already-selected",
+      label: "Pro",
+    });
+    expect(dom.keys).toEqual([]);
+  });
+
+  function useLocalizedSemanticTrigger(dom: ReturnType<typeof buildDirectSlider>) {
+    // ja-JP Chat/Work layout observed 2026-10-03: the composer trigger keeps
+    // data-codex-intelligence-trigger but localizes its aria-label and has no
+    // __composer-pill class, so only the stable data attribute identifies it.
+    useSemanticSlider(dom);
+    dom.pill.setAttribute("aria-label", "ChatGPT モデルを選択");
+    dom.pill.setAttribute("data-codex-intelligence-trigger", "true");
+    dom.pill.setAttribute("class", "");
+    dom.pill.textContent = "思考量思考量";
+    const querySelectorAll = dom.documentStub.querySelectorAll;
+    dom.documentStub.querySelectorAll = (selector: string) => {
+      // Only the locale-independent attribute matches; the English aria-label does not.
+      if (selector.includes("data-codex-intelligence-trigger")) return [dom.pill];
+      if (selector.includes("Select ChatGPT model")) return [];
+      if (selector.includes("__composer-pill")) return [];
+      return querySelectorAll(selector);
+    };
+    return dom;
+  }
+
+  it.each([
+    [1, ["ArrowRight", "ArrowRight", "ArrowRight"], "switched"],
+    [4, [], "already-selected"],
+  ] as const)(
+    "selects Pro on the ja-JP Chat/Work slider from index %s",
+    async (index, expectedKeys, status) => {
+      const dom = useLocalizedSemanticTrigger(buildDirectSlider(index));
+      const labels = ["Instant", "Medium", "High", "Extra High", "Pro"];
+      dom.announcement.textContent = `${labels[index]}、5 件中 ${index + 1} 番目。`;
+      await expect(run(dom.documentStub, "pro", "gpt-5.6-sol")).resolves.toEqual({
+        status,
+        label: "Pro",
+      });
+      expect(dom.keys).toEqual(expectedKeys);
+    },
+  );
+
+  it("does not promote semantic four-tier Extra High to Pro", async () => {
+    const dom = useSemanticSlider(buildDirectSlider(3, undefined, 3));
+    dom.announcement.textContent = "Extra High, 4 of 4";
+    await expect(run(dom.documentStub, "pro", "GPT-6")).resolves.toMatchObject({
+      status: "option-disabled",
+      label: "Pro",
+    });
+    expect(dom.keys).toEqual([]);
+  });
+
+  it("moves to Extra High on the four-tier slider", async () => {
+    const dom = buildDirectSlider(1, undefined, 3);
+    await expect(run(dom.documentStub, "extra-high", "GPT-6")).resolves.toEqual({
+      status: "switched",
+      label: "Extra High",
+    });
+    expect(dom.keys).toEqual(["ArrowRight", "ArrowRight"]);
+  });
+
+  it("recognizes the current three-tier reasoning slider", async () => {
+    const dom = buildDirectSlider(1, ["Instant", "Medium", "High"], 2);
+    dom.announcement.textContent = "Medium, 2 of 3.";
+    const currentControl = new Node(
+      "",
+      {
+        role: "menuitem",
+        "aria-label": "Power",
+        "aria-describedby": "slider-announcement",
+        "data-reasoning-slider": "true",
+      },
+      [dom.thumb],
+    );
+    currentControl.dispatchEvent = dom.control.dispatchEvent;
+    dom.pickerContent.children.splice(0, dom.pickerContent.children.length, currentControl);
+
+    await expect(run(dom.documentStub, "extended", "gpt-5.6-sol")).resolves.toEqual({
+      status: "switched",
+      label: "High",
+    });
+    expect(dom.keys).toEqual(["ArrowRight"]);
+  });
+
+  it("rejects unavailable Pro without input on the four-tier slider", async () => {
+    const dom = buildDirectSlider(3, undefined, 3);
+    await expect(run(dom.documentStub, "pro", "GPT-6")).resolves.toMatchObject({
+      status: "option-disabled",
+      label: "Pro",
+      notice: expect.stringContaining("four-tier"),
+    });
+    expect(dom.keys).toEqual([]);
+  });
+
+  it.each([
+    ["0", "3", "4", "Pro, 5 of 5"],
+    ["0", "3", "3", "Pro, 4 of 4"],
+    ["0", "3", "2", "Extra High, 4 of 4"],
+    ["1", "3", "3", "Extra High, 4 of 4"],
+    ["0", "03", "3", "Extra High, 4 of 4"],
+  ])(
+    "rejects contradictory or unknown slider range %s..%s at %s (%s)",
+    async (min, max, now, label) => {
+      const dom = buildDirectSlider(3);
+      dom.thumb.setAttribute("aria-valuemin", min);
+      dom.thumb.setAttribute("aria-valuemax", max);
+      dom.thumb.setAttribute("aria-valuenow", now);
+      dom.announcement.textContent = label;
+      expect((await run(dom.documentStub, "extra-high", "GPT-6")).status).toBe(
+        "selection-unverified",
+      );
+      expect(dom.keys).toEqual([]);
+    },
+  );
+
+  it("selects Pro from the observed Japanese 極高 tier for Astra GPT-6", async () => {
+    const dom = buildDirectSlider(3, ["Instant", "Medium", "High", "極高", "Pro"]);
+    dom.announcement.textContent = "極高、5件中4件目。";
+    await expect(run(dom.documentStub, "pro", "GPT-6")).resolves.toEqual({
+      status: "switched",
+      label: "Pro",
+    });
+    expect(dom.keys).toEqual(["ArrowRight"]);
+  });
 
   it("selects and verifies Pro on the direct slider without an Advanced row", async () => {
     const dom = buildDirectSlider(2);
@@ -3041,6 +3413,152 @@ describe("unified Intelligence picker with Advanced -> Effort submenu", () => {
       status: "already-selected",
       label: "Pro",
     });
+    expect(dom.keys).toEqual([]);
+  });
+
+  it("recognizes Astra GPT-6's exact 6-prefixed effort owner and selects Pro through the direct slider", async () => {
+    const dom = buildDirectSlider(2);
+    dom.pill.textContent = "6 High";
+
+    await expect(run(dom.documentStub, "pro", "GPT-6")).resolves.toEqual({
+      status: "switched",
+      label: "Pro",
+    });
+    expect(dom.keys).toEqual(["ArrowRight", "ArrowRight"]);
+  });
+
+  it("recognizes Astra GPT-6's Japanese 6-prefixed effort owner", async () => {
+    const dom = buildDirectSlider(3, ["最速", "中程度", "高い", "非常に高い", "Pro"]);
+    dom.pill.textContent = "6\n非常に高い";
+
+    await expect(run(dom.documentStub, "pro", "GPT-6")).resolves.toEqual({
+      status: "switched",
+      label: "Pro",
+    });
+    expect(dom.keys).toEqual(["ArrowRight"]);
+  });
+
+  it.each(["6未知", "5.6 Pro"])(
+    "does not claim %s as Astra GPT-6's effort owner",
+    async (pillText) => {
+      const dom = buildDirectSlider(2);
+      dom.pill.textContent = pillText;
+
+      expect((await run(dom.documentStub, "pro", "GPT-6")).status).toBe("chip-not-found");
+      expect(dom.keys).toEqual([]);
+    },
+  );
+
+  it("waits for the animated keyboard owner to become visible before changing power", async () => {
+    const dom = buildDirectSlider(3);
+    const originalRect = dom.control.getBoundingClientRect.bind(dom.control);
+    let reads = 0;
+    dom.control.getBoundingClientRect = () =>
+      ++reads < 3 ? { width: 200, height: 0 } : originalRect();
+    await expect(run(dom.documentStub, "pro")).resolves.toEqual({
+      status: "switched",
+      label: "Pro",
+    });
+    expect(dom.keys).toEqual(["ArrowRight"]);
+  });
+
+  it("waits for the keyboard owner to be mounted before changing power", async () => {
+    const dom = buildDirectSlider(3);
+    const query = dom.simple.querySelector.bind(dom.simple);
+    let reads = 0;
+    dom.simple.querySelector = (selector: string) =>
+      selector === "[data-model-reasoning-effort-slider]" && ++reads < 3 ? null : query(selector);
+    await expect(run(dom.documentStub, "pro")).resolves.toEqual({
+      status: "switched",
+      label: "Pro",
+    });
+    expect(dom.keys).toEqual(["ArrowRight"]);
+  });
+
+  it("fails without input when the keyboard owner never mounts", async () => {
+    const dom = buildDirectSlider(3);
+    dom.simple.children.length = 0;
+    expect((await run(dom.documentStub, "pro")).status).toBe("selection-unverified");
+    expect(dom.keys).toEqual([]);
+  });
+
+  it("fails without keyboard input when the direct slider remains hidden", async () => {
+    const dom = buildDirectSlider(3);
+    dom.control.getBoundingClientRect = () => ({ width: 200, height: 0 });
+    expect((await run(dom.documentStub, "pro")).status).toBe("selection-unverified");
+    expect(dom.keys).toEqual([]);
+  });
+
+  it.each([
+    ["Portuguese", "Pro, 5 de 5."],
+    ["Japanese", "Pro、5件中5件目。"],
+    ["Unicode punctuation", "Pro—position 5 of 5"],
+    ["fullwidth comma", "Pro，5/5"],
+    ["whitespace", "Pro 5/5"],
+    ["exact label", "Pro"],
+  ])(
+    "verifies Pro through a %s direct-slider announcement",
+    async (_locale: string, announcement: string) => {
+      const dom = buildDirectSlider(4);
+      dom.announcement.textContent = announcement;
+
+      await expect(run(dom.documentStub, "pro")).resolves.toEqual({
+        status: "already-selected",
+        label: "Pro",
+      });
+      expect(dom.keys).toEqual([]);
+    },
+  );
+
+  it("verifies a localized non-Pro label without a comma delimiter", async () => {
+    const dom = buildDirectSlider(3, ["Sofort", "Mittel", "Hoch", "Sehr hoch", "Pro"]);
+    dom.announcement.textContent = "Sehr hoch – 4 von 5";
+
+    await expect(run(dom.documentStub, "extra-high")).resolves.toEqual({
+      status: "already-selected",
+      label: "Sehr hoch",
+    });
+    expect(dom.keys).toEqual([]);
+  });
+
+  it("selects Pro while Japanese announcements update after each arrow key", async () => {
+    const labels = ["最速", "中程度", "高い", "非常に高い", "Pro"];
+    const dom = buildDirectSlider(2, labels);
+    let index = 2;
+    dom.announcement.textContent = "高い、5件中3件目。";
+    dom.control.dispatchEvent = (event: unknown) => {
+      const key = (event as { key?: string }).key;
+      if (key !== "ArrowLeft" && key !== "ArrowRight") return true;
+      dom.keys.push(key);
+      index += key === "ArrowRight" ? 1 : -1;
+      dom.thumb.setAttribute("aria-valuenow", String(index));
+      dom.announcement.textContent = `${labels[index]}、5件中${index + 1}件目。`;
+      return true;
+    };
+
+    await expect(run(dom.documentStub, "pro")).resolves.toEqual({
+      status: "switched",
+      label: "Pro",
+    });
+    expect(dom.keys).toEqual(["ArrowRight", "ArrowRight"]);
+  });
+
+  it.each([
+    "Professional, 5 of 5",
+    "Selected Pro, 5 of 5",
+    "Pro5/5",
+    "5 of 5",
+    "Proé, 5 of 5",
+    "ProЖ, 5 of 5",
+    "Pro𝟙, 5 of 5",
+    "Pro\u0338, 5 of 5",
+    "Pro🙂, 5 of 5",
+    "Pro\u200d, 5 of 5",
+  ])("does not infer Pro from the direct-slider announcement %j", async (announcement: string) => {
+    const dom = buildDirectSlider(4);
+    dom.announcement.textContent = announcement;
+
+    expect((await run(dom.documentStub, "pro")).status).toBe("selection-unverified");
     expect(dom.keys).toEqual([]);
   });
 
@@ -3702,7 +4220,7 @@ describe("unified Intelligence picker with Advanced -> Effort submenu", () => {
         ((line: string) => logs.push(line)) as never,
         null,
       ),
-    ).resolves.toBeUndefined();
+    ).resolves.toMatchObject({ status: "unverified", verified: false });
     expect(logs.join(" ")).toContain("Limit reached. Try again after Aug 16, 2026.");
   });
 
@@ -3754,5 +4272,103 @@ describe("unified Intelligence picker with Advanced -> Effort submenu", () => {
     const logged = logs.join(" ");
     expect(logged).toContain("keeping the effort already selected in ChatGPT");
     expect(logged).not.toContain("continuing with default");
+  });
+});
+
+describe("thinking-effort selection evidence", () => {
+  it("does not report a disabled requested option as the resolved selection", async () => {
+    const runtime = {
+      evaluate: async () => ({
+        result: { value: { status: "option-disabled", label: "Standard", notice: "Unavailable" } },
+      }),
+    };
+    const evidence = await ensureThinkingTime(runtime as never, "standard", () => {}, null);
+    expect(evidence).toMatchObject({
+      requestedLevel: "standard",
+      verified: false,
+      resolvedLabel: null,
+    });
+  });
+  it("records a verified record when the Pro row was already selected", async () => {
+    const runtime = {
+      evaluate: async () => ({
+        result: { value: { status: "already-selected", label: "Pro", modelKind: "pro" } },
+      }),
+    };
+    const evidence = await ensureThinkingTime(
+      runtime as never,
+      "pro",
+      (() => {}) as never,
+      "gpt-5.6-sol",
+    );
+    expect(evidence).toMatchObject({
+      requestedLevel: "pro",
+      status: "already-selected",
+      resolvedLabel: "Pro",
+      verified: true,
+      strictFailClosed: true,
+      observedModelKind: "pro",
+      source: "chatgpt-thinking-picker",
+    });
+    expect(Date.parse(evidence.capturedAt)).not.toBeNaN();
+  });
+
+  it("records a verified record when the picker switched to Pro", async () => {
+    const runtime = {
+      evaluate: async () => ({
+        result: { value: { status: "switched", label: "Pro" } },
+      }),
+    };
+    const evidence = await ensureThinkingTime(
+      runtime as never,
+      "pro",
+      (() => {}) as never,
+      "gpt-5.6-sol",
+    );
+    expect(evidence).toMatchObject({ status: "switched", verified: true, strictFailClosed: true });
+  });
+
+  it("never returns an unverified record for a strict Pro request", async () => {
+    // The whole point of fail-closed: a strict request either produces confirmed
+    // evidence or throws before submit. It must never resolve to verified:false,
+    // because a persisted unverified record would still read as "the run happened".
+    const degraded = [
+      "option-disabled",
+      "chip-not-found",
+      "menu-not-found",
+      "option-not-found",
+      "selection-unverified",
+      "model-kind-not-found",
+      "unknown-status",
+      undefined,
+    ] as const;
+    for (const status of degraded) {
+      const runtime = {
+        evaluate: async () => ({
+          result: { value: status === undefined ? undefined : { status } },
+        }),
+      };
+      await expect(
+        ensureThinkingTime(runtime as never, "pro", (() => {}) as never, "gpt-5.6-sol"),
+      ).rejects.toThrow();
+    }
+  });
+
+  it("marks a non-strict degraded selection unverified rather than silently succeeding", async () => {
+    const runtime = {
+      evaluate: async () => ({ result: { value: { status: "selection-unverified" } } }),
+    };
+    const evidence = await ensureThinkingTime(
+      runtime as never,
+      "standard",
+      (() => {}) as never,
+      null,
+    );
+    expect(evidence).toMatchObject({
+      requestedLevel: "standard",
+      status: "unverified",
+      verified: false,
+      strictFailClosed: false,
+    });
   });
 });

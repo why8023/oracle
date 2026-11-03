@@ -34,6 +34,7 @@ JSON5 parsing, so trailing commas and comments are allowed.
     timeoutMs: 1200000,
     inputTimeoutMs: 30000,
     attachmentTimeoutMs: 90000, // wait for file upload/readiness before clicking Send (default: 45s)
+    captureProviderNative: false, // opt in to full ChatGPT conversation evidence (user config only)
     cookieSync: false, // opt in to copying cookies from a live Chrome profile (prefer manualLogin)
     cookieSyncWaitMs: 0, // wait (ms) before retrying cookie sync when Chrome cookies are empty/locked
     assistantRecheckDelayMs: 0, // wait this long after timeout, then retry capture (0 = disabled)
@@ -51,6 +52,7 @@ JSON5 parsing, so trailing commas and comments are allowed.
     manualLoginProfileDir: null, // override profile dir (or set ORACLE_BROWSER_PROFILE_DIR)
     headless: false,
     hideWindow: false,
+    noFocus: false, // keep Chrome in the background during launch, new tabs, and send (see --browser-no-focus)
     keepBrowser: false,
     manualLoginCookieSync: false, // explicitly seed the manual-login profile from live Chrome cookies
   },

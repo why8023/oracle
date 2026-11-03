@@ -24,6 +24,8 @@ import * as attachments from "../../src/browser/actions/attachments.js";
 import * as attachmentDataTransfer from "../../src/browser/actions/attachmentDataTransfer.js";
 import type { ChromeClient } from "../../src/browser/types.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
+import { FakeDocument, FakeElement, FakeInputElement } from "./domFixture.js";
+import { formatUserErrorMetadata } from "../../src/cli/sessionDisplay.js";
 
 const logger = vi.fn();
 
@@ -91,22 +93,290 @@ describe("ensureModelSelection", () => {
 });
 
 describe("navigateToChatGPT", () => {
-  test("navigates and waits for ready state", async () => {
-    const navigate = vi.fn().mockResolvedValue(undefined);
-    const runtime = {
-      evaluate: vi
-        .fn()
-        .mockResolvedValueOnce({ result: { value: "loading" } })
-        .mockResolvedValueOnce({ result: { value: "complete" } }),
-    } as unknown as ChromeClient["Runtime"];
-    await navigateToChatGPT(
-      { navigate } as unknown as ChromeClient["Page"],
-      runtime,
-      "https://chat.openai.com",
-      logger,
+  type TabState = { readyState: string; href: string };
+  type NavigationStep = TabState & { errorText?: string };
+
+  // A tab whose document changes on each Page.navigate. Runtime.evaluate runs the real readiness
+  // expression against that document, so the test checks what Oracle actually reads.
+  function fakeTab(
+    steps: NavigationStep[],
+    initial: TabState = { readyState: "complete", href: "about:blank" },
+  ) {
+    let current: TabState = initial;
+    let index = 0;
+    const navigate = vi.fn(async () => {
+      const step = steps[Math.min(index, steps.length - 1)];
+      index += 1;
+      current = { readyState: step.readyState, href: step.href };
+      return step.errorText
+        ? { frameId: "frame", errorText: step.errorText }
+        : { frameId: "frame" };
+    });
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      const value = new Function("document", "location", `return ${expression};`)(
+        { readyState: current.readyState },
+        { href: current.href },
+      );
+      return { result: { value } };
+    });
+    return {
+      Page: { navigate } as unknown as ChromeClient["Page"],
+      Runtime: { evaluate } as unknown as ChromeClient["Runtime"],
+      navigate,
+      settle: (state: TabState) => {
+        current = state;
+      },
+    };
+  }
+
+  async function navigateWithFakeTimers(tab: ReturnType<typeof fakeTab>, url: string) {
+    vi.useFakeTimers();
+    try {
+      const outcome = navigateToChatGPT(tab.Page, tab.Runtime, url, logger).then(
+        () => "loaded" as const,
+        (error: unknown) => error,
+      );
+      await vi.advanceTimersByTimeAsync(120_000);
+      return await outcome;
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  test("navigates once and waits for the document to become ready", async () => {
+    const tab = fakeTab([{ readyState: "loading", href: "https://chatgpt.com/" }]);
+    vi.useFakeTimers();
+    try {
+      const outcome = navigateToChatGPT(tab.Page, tab.Runtime, "https://chatgpt.com/", logger);
+      await vi.advanceTimersByTimeAsync(300);
+      tab.settle({ readyState: "complete", href: "https://chatgpt.com/" });
+      await vi.advanceTimersByTimeAsync(300);
+      await expect(outcome).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(tab.navigate).toHaveBeenCalledTimes(1);
+    expect(tab.navigate).toHaveBeenCalledWith({ url: "https://chatgpt.com/" });
+  });
+
+  test("does not accept a tab left on about:blank as the loaded page, and retries once", async () => {
+    const tab = fakeTab([
+      { readyState: "complete", href: "about:blank" },
+      { readyState: "complete", href: "https://chatgpt.com/" },
+    ]);
+    await expect(navigateWithFakeTimers(tab, "https://chatgpt.com/")).resolves.toBe("loaded");
+    expect(tab.navigate).toHaveBeenCalledTimes(2);
+    expect(logger).toHaveBeenCalledWith(
+      expect.stringMatching(/^\[browser\] Page did not load \(.*url=about:blank\); retrying/),
     );
-    expect(navigate).toHaveBeenCalledWith({ url: "https://chat.openai.com" });
-    expect(runtime.evaluate).toHaveBeenCalledTimes(2);
+  });
+
+  test("retries once when Page.navigate reports a navigation error", async () => {
+    const tab = fakeTab([
+      {
+        errorText: "net::ERR_CONNECTION_RESET",
+        readyState: "complete",
+        href: "chrome-error://chromewebdata/",
+      },
+      { readyState: "complete", href: "https://chatgpt.com/" },
+    ]);
+    await expect(navigateWithFakeTimers(tab, "https://chatgpt.com/")).resolves.toBe("loaded");
+    expect(tab.navigate).toHaveBeenCalledTimes(2);
+    expect(logger).toHaveBeenCalledWith(
+      expect.stringContaining("navigation failed: net::ERR_CONNECTION_RESET"),
+    );
+  });
+
+  test("fails with a next step when both navigations report an error", async () => {
+    const tab = fakeTab([
+      {
+        errorText: "net::ERR_NAME_NOT_RESOLVED",
+        readyState: "complete",
+        href: "chrome-error://chromewebdata/",
+      },
+    ]);
+    const outcome = await navigateWithFakeTimers(tab, "https://chatgpt.com/?state=SENTINEL");
+    expect(outcome).toBeInstanceOf(BrowserAutomationError);
+    expect((outcome as Error).message).toBe(
+      "Page did not load (navigation failed: net::ERR_NAME_NOT_RESOLVED), including one navigation retry. Check that https://chatgpt.com/ opens in that Chrome window, then rerun.",
+    );
+    expect(tab.navigate).toHaveBeenCalledTimes(2);
+  });
+
+  test("retries once when the document stays loading", async () => {
+    const tab = fakeTab([
+      { readyState: "loading", href: "https://chatgpt.com/" },
+      { readyState: "interactive", href: "https://chatgpt.com/" },
+    ]);
+    await expect(navigateWithFakeTimers(tab, "https://chatgpt.com/")).resolves.toBe("loaded");
+    expect(tab.navigate).toHaveBeenCalledTimes(2);
+  });
+
+  test("fails after a single retry when the page never loads", async () => {
+    const tab = fakeTab([{ readyState: "complete", href: "about:blank" }]);
+    const outcome = await navigateWithFakeTimers(tab, "https://chatgpt.com/");
+    expect(outcome).toBeInstanceOf(BrowserAutomationError);
+    expect((outcome as Error).message).toMatch(
+      /Page did not reach ready state in time \(readyState=complete, url=about:blank\), including one navigation retry\. Check that https:\/\/chatgpt\.com\/ opens in that Chrome window, then rerun\.$/,
+    );
+    expect(tab.navigate).toHaveBeenCalledTimes(2);
+  });
+
+  test("still treats about:blank as loaded when it is the requested URL", async () => {
+    const tab = fakeTab([{ readyState: "complete", href: "about:blank" }]);
+    await expect(navigateWithFakeTimers(tab, "about:blank")).resolves.toBe("loaded");
+    expect(tab.navigate).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(["Execution context was destroyed.", "Inspected target navigated or closed"])(
+    "keeps polling through a navigation interruption (%s)",
+    async (message) => {
+      const tab = fakeTab([{ readyState: "complete", href: "https://chatgpt.com/" }]);
+      const evaluate = tab.Runtime.evaluate as unknown as ReturnType<typeof vi.fn>;
+      evaluate.mockRejectedValueOnce(new Error(message));
+      await expect(navigateWithFakeTimers(tab, "https://chatgpt.com/")).resolves.toBe("loaded");
+      expect(tab.navigate).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test("fails at once when the DevTools connection drops", async () => {
+    const tab = fakeTab([{ readyState: "loading", href: "https://chatgpt.com/" }]);
+    const evaluate = tab.Runtime.evaluate as unknown as ReturnType<typeof vi.fn>;
+    evaluate.mockRejectedValueOnce(new Error("WebSocket connection closed"));
+    vi.useFakeTimers();
+    try {
+      const start = Date.now();
+      let settledAt = 0;
+      const outcome = navigateToChatGPT(tab.Page, tab.Runtime, "https://chatgpt.com/", logger).then(
+        () => "loaded",
+        (error: unknown) => {
+          settledAt = Date.now();
+          return error;
+        },
+      );
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(((await outcome) as Error).message).toBe("WebSocket connection closed");
+      expect(settledAt - start).toBeLessThan(1_000);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(tab.navigate).toHaveBeenCalledTimes(1);
+  });
+
+  test("waits for the successor page instead of re-navigating on ERR_ABORTED", async () => {
+    const tab = fakeTab([
+      {
+        errorText: "net::ERR_ABORTED",
+        readyState: "loading",
+        href: "https://auth.openai.com/log-in",
+      },
+    ]);
+    vi.useFakeTimers();
+    try {
+      const outcome = navigateToChatGPT(tab.Page, tab.Runtime, "https://chatgpt.com/", logger);
+      await vi.advanceTimersByTimeAsync(2_000);
+      tab.settle({ readyState: "complete", href: "https://chatgpt.com/" });
+      await vi.advanceTimersByTimeAsync(300);
+      await expect(outcome).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(tab.navigate).toHaveBeenCalledTimes(1);
+    expect(logger).not.toHaveBeenCalledWith(expect.stringContaining("retrying navigation"));
+  });
+
+  test("re-navigates after ERR_ABORTED only once the readiness window has passed", async () => {
+    const tab = fakeTab([
+      { errorText: "net::ERR_ABORTED", readyState: "complete", href: "about:blank" },
+      { readyState: "complete", href: "https://chatgpt.com/" },
+    ]);
+    vi.useFakeTimers();
+    try {
+      const outcome = navigateToChatGPT(tab.Page, tab.Runtime, "https://chatgpt.com/", logger);
+      await vi.advanceTimersByTimeAsync(44_000);
+      expect(tab.navigate).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(outcome).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(tab.navigate).toHaveBeenCalledTimes(2);
+    expect(logger).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Page did not load (navigation aborted (net::ERR_ABORTED); readyState=complete, url=about:blank)",
+      ),
+    );
+  });
+
+  test("retries after the first 45 s readiness window and fails after the second", async () => {
+    const tab = fakeTab([{ readyState: "loading", href: "https://chatgpt.com/" }]);
+    vi.useFakeTimers();
+    try {
+      let settled = false;
+      const outcome = navigateToChatGPT(tab.Page, tab.Runtime, "https://chatgpt.com/", logger).then(
+        () => "loaded",
+        (error: unknown) => {
+          settled = true;
+          return error;
+        },
+      );
+      await vi.advanceTimersByTimeAsync(44_500);
+      expect(tab.navigate).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(tab.navigate).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(43_500);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(settled).toBe(true);
+      expect(((await outcome) as Error).message).toMatch(
+        /^Page did not reach ready state in time \(readyState=loading/,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("prints observed and requested URLs without userinfo, query or fragment", async () => {
+    const tab = fakeTab([
+      {
+        readyState: "loading",
+        href: "https://user:SECRET_PASS@chatgpt.com/auth/x?state=STATE_SENTINEL#frag=FRAG_SENTINEL",
+      },
+    ]);
+    const outcome = await navigateWithFakeTimers(tab, "https://chatgpt.com/g/p?q=REQ_SENTINEL#R");
+    // Lines with the [browser] prefix and the error are what prints without --verbose.
+    const printed = [
+      ...logger.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.startsWith("[browser] ")),
+      (outcome as Error).message,
+    ].join("\n");
+    expect(printed).toContain("url=https://chatgpt.com/auth/x)");
+    expect(printed).toContain("retrying navigation to https://chatgpt.com/g/p once");
+    expect(printed).not.toMatch(/SENTINEL|SECRET_PASS|#R/);
+  });
+
+  test("keeps the requested URL's userinfo, query and fragment out of session error metadata", async () => {
+    const tab = fakeTab([
+      {
+        errorText: "net::ERR_NAME_NOT_RESOLVED",
+        readyState: "complete",
+        href: "chrome-error://chromewebdata/",
+      },
+    ]);
+    const outcome = await navigateWithFakeTimers(
+      tab,
+      "https://user:SECRET_PASS@chatgpt.com/g/p/project?state=STATE_SENTINEL#FRAG_SENTINEL",
+    );
+    const error = outcome as BrowserAutomationError;
+    // What `oracle session <id>` prints for a stored user error.
+    const metadata = formatUserErrorMetadata({
+      category: error.category,
+      message: error.message,
+      details: error.details,
+    });
+    expect(metadata).toContain('"url":"https://chatgpt.com/g/p/project"');
+    expect(metadata).not.toMatch(/SENTINEL|SECRET_PASS/);
   });
 });
 
@@ -153,6 +423,80 @@ describe("navigateToPromptReadyWithFallback", () => {
     expect(ensurePromptReadyMock).toHaveBeenNthCalledWith(1, runtime, 5_000, logger);
     expect(ensurePromptReadyMock).toHaveBeenNthCalledWith(2, runtime, 120_000, logger);
   });
+
+  class ClickableElement extends FakeElement {
+    clicks = 0;
+    click(): void {
+      this.clicks += 1;
+    }
+  }
+
+  // Runs the real dismissal expression against a fake DOM on both the initial and fallback navigation.
+  const navigateWithDom = async (children: FakeElement[]) => {
+    const document = new FakeDocument(children);
+    const window = {
+      getComputedStyle: (el: FakeElement) => ({
+        display: "block",
+        visibility: "visible",
+        opacity: el.getAttribute("data-state") === "closed" ? "0" : "1",
+      }),
+    };
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+        result: {
+          value: new Function("document", "window", "HTMLElement", `return ${expression};`)(
+            document,
+            window,
+            FakeElement,
+          ),
+        },
+      })),
+    } as unknown as ChromeClient["Runtime"];
+    await navigateToPromptReadyWithFallback(
+      {} as unknown as ChromeClient["Page"],
+      runtime,
+      {
+        url: "https://chatgpt.com/g/g-p-target/project",
+        fallbackUrl: "https://chatgpt.com/",
+        timeoutMs: 5_000,
+        headless: false,
+        logger,
+      },
+      {
+        navigateToChatGPT: vi.fn().mockResolvedValue(undefined),
+        ensureNotBlocked: vi.fn().mockResolvedValue(undefined),
+        ensurePromptReady: vi
+          .fn()
+          .mockRejectedValueOnce(new Error("Prompt textarea did not appear before timeout"))
+          .mockResolvedValueOnce(undefined),
+      },
+    );
+  };
+
+  test("does not click sidebar conversations whose titles look like dismiss controls", async () => {
+    const closeChat = new ClickableElement("a", { href: "/c/abc" }, [], "Close test task");
+    const returnChat = new ClickableElement("a", { href: "/c/def" }, [], "Return policy draft");
+
+    await navigateWithDom([new FakeElement("nav", {}, [closeChat, returnChat])]);
+
+    expect(closeChat.clicks).toBe(0);
+    expect(returnChat.clicks).toBe(0);
+    expect(logger).not.toHaveBeenCalledWith(expect.stringContaining("dismissed blocking UI"));
+  });
+
+  test("dismisses a visible dialog but not a hidden one", async () => {
+    const hiddenOk = new ClickableElement("button", {}, [], "Got it");
+    const close = new ClickableElement("button", { "aria-label": "Close" });
+
+    await navigateWithDom([
+      new FakeElement("div", { role: "dialog", "data-state": "closed" }, [hiddenOk]),
+      new FakeElement("div", { role: "dialog" }, [close]),
+    ]);
+
+    expect(close.clicks).toBe(2);
+    expect(hiddenOk.clicks).toBe(0);
+    expect(logger).toHaveBeenCalledWith("[nav] dismissed blocking UI (close)");
+  });
 });
 
 describe("ensurePromptReady", () => {
@@ -170,6 +514,120 @@ describe("ensurePromptReady", () => {
     } as unknown as ChromeClient["Runtime"];
     await expect(ensurePromptReady(runtime, 0, logger)).rejects.toThrow(/textarea did not appear/i);
   });
+
+  const preHydrationShell = () =>
+    new FakeDocument([new FakeElement("textarea", { id: "pending-home-input" })]);
+  const hydratedComposer = () =>
+    new FakeDocument([
+      new FakeElement("form", {}, [
+        new FakeElement("div", { class: "ProseMirror", contenteditable: "true", role: "textbox" }),
+        new FakeInputElement([]),
+      ]),
+    ]);
+  const runtimeOver = (pages: Array<() => FakeDocument>) => {
+    let calls = 0;
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      const document = pages[Math.min(calls, pages.length - 1)]();
+      calls += 1;
+      try {
+        return {
+          result: {
+            value: new Function("document", `return ${expression};`)(document),
+          },
+        };
+      } catch {
+        return { result: { value: undefined } };
+      }
+    });
+    return { evaluate } as unknown as ChromeClient["Runtime"] & { evaluate: typeof evaluate };
+  };
+
+  test("does not accept ChatGPT's pre-hydration placeholder as a composer", async () => {
+    const runtime = runtimeOver([preHydrationShell]);
+    await expect(ensurePromptReady(runtime, 300, logger)).rejects.toThrow(
+      /textarea did not appear/i,
+    );
+  });
+
+  test("waits for the hydrated composer that replaces the placeholder", async () => {
+    const runtime = runtimeOver([preHydrationShell, preHydrationShell, hydratedComposer]);
+    await expect(ensurePromptReady(runtime, 5_000, logger)).resolves.toBeUndefined();
+    expect(runtime.evaluate).toHaveBeenCalledTimes(3);
+  });
+
+  const manualLoginLog = "Auth login page detected; waiting for manual login to complete...";
+
+  const locationRuntime = (href: string) => {
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression.includes("location.href")) {
+        return { result: { value: href } };
+      }
+      return { result: { value: false } };
+    });
+    return { evaluate } as unknown as ChromeClient["Runtime"];
+  };
+
+  const finishPromptWait = async (href: string) => {
+    vi.useFakeTimers();
+    try {
+      const pending = ensurePromptReady(locationRuntime(href), 0, logger);
+      const result = pending.then(
+        () => "resolved" as const,
+        (error: unknown) => error,
+      );
+      await vi.advanceTimersByTimeAsync(60_000);
+      return await result;
+    } finally {
+      vi.useRealTimers();
+    }
+  };
+
+  test.each([
+    "https://notauth.openai.com/",
+    "https://auth.openai.com.evil.test/",
+    "https://foo.auth.openai.com.evil.test/",
+    "https://evilauth.openai.com/session",
+    "https://auth.openai.com@notauth.openai.com/authorize",
+    "https://notauth.openai.com:8443/authorize",
+  ])("does not extend the prompt wait for lookalike auth host %s", async (href) => {
+    const outcome = await finishPromptWait(href);
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toMatch(/textarea did not appear/i);
+    expect(logger).not.toHaveBeenCalledWith(manualLoginLog);
+  });
+
+  test.each([
+    "https://auth.openai.com/authorize",
+    "https://login.auth.openai.com/authorize",
+    "https://Auth.OpenAI.com./authorize",
+    "https://chatgpt.com/log-in",
+    "https://notauth.openai.com@auth.openai.com/authorize",
+  ])("still waits for manual login on %s", async (href) => {
+    vi.useFakeTimers();
+    try {
+      const pending = ensurePromptReady(locationRuntime(href), 0, logger);
+      let settled = false;
+      const result = pending.then(
+        () => {
+          settled = true;
+          return "resolved" as const;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        },
+      );
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(logger).toHaveBeenCalledWith(manualLoginLog);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(59_000);
+      const outcome = await result;
+      expect(outcome).toBeInstanceOf(Error);
+      expect((outcome as Error).message).toMatch(/textarea did not appear/i);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("ensureChatMode", () => {
@@ -186,6 +644,10 @@ describe("ensureChatMode", () => {
     ) {
       const tokens = new Set(classes);
       this.classList = { contains: (value: string) => tokens.has(value) };
+    }
+
+    closest(): null {
+      return null;
     }
 
     hasAttribute(name: string) {
@@ -246,11 +708,14 @@ describe("ensureChatMode", () => {
           return null;
         },
         querySelectorAll: (selector: string) => (selector === "span" ? descendants : []),
+        closest: () => null,
+        querySelector: () => null,
       }),
     );
     const document = {
+      querySelector: () => null,
       querySelectorAll: (selector: string) =>
-        selector === 'a.__menu-item[href*="/c/"]'
+        selector.includes('a.__menu-item[href*="/c/"]')
           ? historyLinks.filter((link) => link.trustedHistory)
           : [],
     };
@@ -701,6 +1166,32 @@ describe("waitForResumedConversationHydration", () => {
           actualConversationId: "other-thread",
         },
       });
+      await vi.runAllTimersAsync();
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("counts current search-unit messages as stable prior turns", async () => {
+    const document = new FakeDocument([
+      new FakeElement("div", { "data-content-search-turn-key": "fallback-turn-0" }, [
+        new FakeElement("div", { "data-content-search-unit-key": "fallback-turn-0:0:user" }),
+        new FakeElement("div", { "data-content-search-unit-key": "fallback-turn-0:2:assistant" }),
+      ]),
+    ]);
+    vi.useFakeTimers();
+    try {
+      const runtime = {
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => ({
+          result: { value: new Function("document", `return ${expression};`)(document) },
+        })),
+      } as unknown as ChromeClient["Runtime"];
+      const promise = waitForResumedConversationHydration(runtime, 5_000, logger, {
+        requirePriorTurns: true,
+        requirePromptReady: false,
+      });
+      const assertion = expect(promise).resolves.toBe(2);
       await vi.runAllTimersAsync();
       await assertion;
     } finally {
@@ -1179,7 +1670,26 @@ describe("ensureLoggedIn", () => {
     }
   });
 
-  test("keeps auth pages and visible login CTAs authoritative", async () => {
+  test.each(["profile", "history"] as const)(
+    "accepts a confirmed session with a %s affordance despite an unrelated login CTA",
+    async (appSignal) => {
+      await expect(
+        runLoginProbeForLabels(["Log in"], {
+          composerVisible: true,
+          appSignal,
+        }),
+      ).resolves.toMatchObject({
+        ok: true,
+        status: 200,
+        sessionAuthenticated: true,
+        sessionResolved: true,
+        domLoginCta: true,
+        appAuthenticated: true,
+      });
+    },
+  );
+
+  test("keeps auth pages authoritative even with a confirmed session and app DOM", async () => {
     await expect(
       runLoginProbeForLabels([], {
         pathname: "/auth/login",
@@ -1191,9 +1701,16 @@ describe("ensureLoggedIn", () => {
       onAuthPage: true,
       appAuthenticated: true,
     });
+  });
 
+  test.each([
+    { sessionBody: {} },
+    { sessionStatus: 503, backendStatus: 200 },
+    { sessionStatus: 503, backendStatus: 401 },
+  ])("keeps a login CTA authoritative without a confirmed session: %j", async (auth) => {
     await expect(
       runLoginProbeForLabels(["Log in"], {
+        ...auth,
         composerVisible: true,
         appSignal: "history",
       }),
@@ -1382,6 +1899,237 @@ describe("ensureLoggedIn", () => {
     );
   });
 
+  // A rendered page for the real login probe and Welcome-back expressions. Its visible buttons
+  // carry `labels`; `click` (a saved-account chip) can move the tab and change what fetches return.
+  type PageState = {
+    href: string;
+    fetchFails: boolean;
+    sessionStatus?: number;
+    signedIn?: boolean;
+    labels?: readonly string[];
+    readyState?: string;
+    // A visible composer and profile button: the authenticated-app signal.
+    app?: boolean;
+  };
+  async function runLoginOnPage(page: PageState & { afterClick?: PageState }) {
+    const state: PageState = { ...page };
+    const location = { href: state.href, pathname: new URL(state.href).pathname };
+    class FakeHTMLElement {
+      constructor(public textContent: string) {}
+      getAttribute() {
+        return "";
+      }
+      getBoundingClientRect() {
+        return { width: 120, height: 32 };
+      }
+      click() {
+        if (!page.afterClick) return;
+        Object.assign(state, page.afterClick);
+        location.href = state.href;
+        location.pathname = new URL(state.href).pathname;
+      }
+    }
+    const document = {
+      querySelectorAll: vi.fn(() =>
+        (state.labels ?? []).map((label) => new FakeHTMLElement(label)),
+      ),
+      querySelector: vi.fn((selector: string) =>
+        state.app &&
+        (selector === "#prompt-textarea" || selector === '[data-testid="accounts-profile-button"]')
+          ? new FakeHTMLElement("")
+          : null,
+      ),
+      get readyState() {
+        return state.readyState ?? "complete";
+      },
+    };
+    const window = {
+      getComputedStyle: vi.fn(() => ({ display: "block", visibility: "visible" })),
+    };
+    const fetch = vi.fn(async (url: string) => {
+      if (state.fetchFails) throw new TypeError("Failed to fetch");
+      const status = url === "/api/auth/session" ? (state.sessionStatus ?? 200) : 401;
+      const body = state.signedIn ? { user: { id: "test-user" } } : {};
+      return { status, json: async () => body, clone: () => ({ text: async () => "" }) };
+    });
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      const value = await new Function(
+        "document",
+        "window",
+        "HTMLElement",
+        "fetch",
+        "location",
+        `return ${expression};`,
+      )(document, window, FakeHTMLElement, fetch, location);
+      return { result: { value } };
+    });
+    vi.useFakeTimers();
+    try {
+      const outcome = ensureLoggedIn({ evaluate } as unknown as ChromeClient["Runtime"], logger, {
+        appliedCookies: 0,
+      }).then(
+        () => "passed" as const,
+        (error: unknown) => error,
+      );
+      await vi.advanceTimersByTimeAsync(60_000);
+      return await outcome;
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  test("reports a tab that never reached ChatGPT as not loaded instead of signed out", async () => {
+    const error = await runLoginOnPage({ href: "about:blank", fetchFails: true });
+    expect(error).toBeInstanceOf(BrowserAutomationError);
+    expect((error as Error).message).toMatch(
+      /^ChatGPT page did not load \(url=about:blank, error=TypeError: Failed to fetch\)/,
+    );
+    expect((error as Error).message).not.toMatch(/session not detected|cookies|not a sign-out/i);
+    expect(logger).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /^\[browser\] Login probe failed \(sessionStatus=0, .*url=about:blank, readyState=/,
+      ),
+    );
+    expect(logger).not.toHaveBeenCalledWith(
+      "Welcome back modal not detected after login probe failure.",
+    );
+  });
+
+  test("keeps a rendered sign-in page on the sign-in path when its fetches fail", async () => {
+    // The CTA detector matches English labels only, so a localized login button is invisible to
+    // it; failed fetches on a web page must still not be read as an unloaded page.
+    const error = await runLoginOnPage({
+      href: "https://chatgpt.com/",
+      fetchFails: true,
+      labels: ["登录"],
+    });
+    expect((error as Error).message).toMatch(/^ChatGPT session not detected\./);
+    expect(logger).toHaveBeenCalledWith(
+      "Welcome back modal not detected after login probe failure.",
+    );
+    expect(logger).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /^\[browser\] Login probe failed \(sessionStatus=0, .*url=https:\/\/chatgpt\.com\//,
+      ),
+    );
+  });
+
+  test("still clicks the saved account when the picker's page fetches fail until then", async () => {
+    const outcome = await runLoginOnPage({
+      href: "https://chatgpt.com/",
+      fetchFails: true,
+      labels: ["only@example.test"],
+      afterClick: { href: "https://chatgpt.com/", fetchFails: false, signedIn: true },
+    });
+    expect(outcome).toBe("passed");
+    expect(logger).toHaveBeenCalledWith("Login restored via Welcome back account picker");
+  });
+
+  test("reports the Welcome-back redirect as not loaded when it leaves the tab off ChatGPT", async () => {
+    const error = await runLoginOnPage({
+      href: "https://chatgpt.com/",
+      fetchFails: false,
+      sessionStatus: 401,
+      labels: ["only@example.test"],
+      afterClick: { href: "about:blank", fetchFails: true },
+    });
+    expect(error).toBeInstanceOf(BrowserAutomationError);
+    expect((error as Error).message).toMatch(
+      /^ChatGPT page did not load after Welcome back \(url=about:blank, error=TypeError: Failed to fetch\)/,
+    );
+    expect(logger).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /^\[browser\] Login probe failed after Welcome back \(sessionStatus=0, .*url=about:blank/,
+      ),
+    );
+  });
+
+  test.each([
+    [
+      "signed out",
+      { href: "https://chatgpt.com/", fetchFails: false },
+      /^ChatGPT session not detected\./,
+    ],
+    ["signed in", { href: "https://chatgpt.com/", fetchFails: false, signedIn: true }, "passed"],
+    [
+      "on a saved-account picker",
+      {
+        href: "https://chatgpt.com/",
+        fetchFails: true,
+        labels: ["only@example.test"],
+        afterClick: { href: "https://chatgpt.com/", fetchFails: false, signedIn: true },
+      },
+      "passed",
+    ],
+  ] as const)(
+    "treats a web page that is still loading as loaded when %s",
+    async (_label, page, expected) => {
+      const outcome = await runLoginOnPage({ ...page, readyState: "loading" });
+      if (expected === "passed") {
+        expect(outcome).toBe("passed");
+      } else {
+        expect((outcome as Error).message).toMatch(expected);
+      }
+      expect(String((outcome as Error)?.message ?? "")).not.toMatch(/did not load/);
+    },
+  );
+
+  test("restores the login after Welcome back when only a stray login control remains", async () => {
+    const outcome = await runLoginOnPage({
+      href: "https://chatgpt.com/",
+      fetchFails: false,
+      sessionStatus: 401,
+      labels: ["only@example.test"],
+      afterClick: {
+        href: "https://chatgpt.com/",
+        fetchFails: false,
+        sessionStatus: 200,
+        signedIn: true,
+        app: true,
+        labels: ["Log in"],
+      },
+    });
+    expect(outcome).toBe("passed");
+    expect(logger).toHaveBeenCalledWith("Login restored via Welcome back account picker");
+  });
+
+  test("names a login button from the latest probe in the final error", async () => {
+    const error = await runLoginOnPage({
+      href: "https://chatgpt.com/",
+      fetchFails: false,
+      sessionStatus: 401,
+      labels: ["only@example.test"],
+      afterClick: {
+        href: "https://chatgpt.com/",
+        fetchFails: false,
+        sessionStatus: 200,
+        labels: ["Log in"],
+      },
+    });
+    expect((error as Error).message).toMatch(
+      /^ChatGPT session not detected\. Login button detected on page\./,
+    );
+  });
+
+  test("prints the latest failed probe after a Welcome-back retry", async () => {
+    const error = await runLoginOnPage({
+      href: "https://chatgpt.com/",
+      fetchFails: false,
+      sessionStatus: 401,
+      labels: ["only@example.test"],
+      afterClick: { href: "https://chatgpt.com/", fetchFails: false, sessionStatus: 200 },
+    });
+    expect((error as Error).message).toMatch(/^ChatGPT session not detected\./);
+    const detail = logger.mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.startsWith("[browser] Login probe failed"));
+    expect(detail).toEqual([
+      expect.stringMatching(
+        /^\[browser\] Login probe failed after Welcome back \(sessionStatus=200, .*sessionResolved=true/,
+      ),
+    ]);
+  });
+
   test("treats welcome-back navigation during account click as login progress", async () => {
     const runtime = {
       evaluate: vi
@@ -1402,6 +2150,55 @@ describe("ensureLoggedIn", () => {
 });
 
 describe("waitForAssistantResponse", () => {
+  test("fails promptly when the submitted assistant turn offers Retry", async () => {
+    const payload = {
+      text: "Something went wrong while generating the response.",
+      messageId: "mid",
+      turnId: "tid",
+      turnIndex: 2,
+      uiError: "temporary_unavailable",
+    };
+    const evaluate = vi.fn().mockResolvedValue({ result: { type: "object", value: payload } });
+
+    await expect(
+      waitForAssistantResponse(
+        { evaluate } as unknown as ChromeClient["Runtime"],
+        30_000,
+        logger,
+        2,
+      ),
+    ).rejects.toMatchObject({
+      category: "browser-automation",
+      details: {
+        stage: "assistant-ui-error",
+        code: "chatgpt-ui-warning",
+        uiWarning: { type: "temporary_unavailable" },
+      },
+    });
+  });
+
+  test("stops the pending renderer observer when the Retry watchdog fails", async () => {
+    const evaluate = vi.fn().mockImplementation(({ awaitPromise }) =>
+      awaitPromise
+        ? new Promise(() => {})
+        : Promise.resolve({
+            result: {
+              value: { text: "Something went wrong.", uiError: "temporary_unavailable" },
+            },
+          }),
+    );
+    const terminateExecution = vi.fn().mockResolvedValue(undefined);
+    await expect(
+      waitForAssistantResponse(
+        { evaluate, terminateExecution } as unknown as ChromeClient["Runtime"],
+        30_000,
+        logger,
+        2,
+      ),
+    ).rejects.toMatchObject({ details: { stage: "assistant-ui-error" } });
+    expect(terminateExecution).toHaveBeenCalledOnce();
+  });
+
   test("returns captured assistant payload", async () => {
     vi.useFakeTimers();
     try {
@@ -1645,6 +2442,47 @@ describe("waitForAssistantResponse", () => {
     }
   });
 
+  test("does not finish a stable action bar when the thinking read fails", async () => {
+    vi.useFakeTimers();
+    try {
+      const answer = {
+        text: "The answer is still being reasoned about in the sidecar.",
+        html: "<p>The answer is still being reasoned about in the sidecar.</p>",
+        messageId: "mid",
+        turnId: "tid",
+      };
+      const evaluate = vi
+        .fn()
+        .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+          if (params.awaitPromise) {
+            return { result: { type: "object", value: answer } };
+          }
+          const expression = String(params.expression ?? "");
+          if (expression.includes("extractAssistantTurn")) {
+            return { result: { value: answer } };
+          }
+          if (expression.includes("return readThinkingActivity()")) {
+            throw new Error("thinking evaluate failed");
+          }
+          if (expression.includes("Find the LAST assistant turn")) {
+            return { result: { value: true } };
+          }
+          return { result: { value: false } };
+        });
+
+      const promise = waitForAssistantResponse(
+        { evaluate } as unknown as ChromeClient["Runtime"],
+        6_000,
+        logger,
+      );
+      const assertion = expect(promise).rejects.toThrow(/refusing to finalize/i);
+      await vi.advanceTimersByTimeAsync(7_000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("keeps a legitimate short completion after watchdog confirmation", async () => {
     vi.useFakeTimers();
     try {
@@ -1694,7 +2532,9 @@ describe("waitForAssistantResponse", () => {
     expect(capturedExpression).toContain("characterData: true");
     expect(capturedExpression).toContain("copy-turn-action-button");
     expect(capturedExpression).toContain("isLastAssistantTurnFinished");
-    expect(capturedExpression).toContain("lastAssistantTurn.querySelector(FINISHED_SELECTOR)");
+    expect(capturedExpression).toContain(
+      "findTurnAction(lastAssistantTurn, FINISHED_SELECTOR, FINISHED_SELECTOR)",
+    );
     expect(capturedExpression).not.toContain("document.querySelector(FINISHED_SELECTOR)");
     expect(capturedExpression).toContain("lastAssistantTurn.querySelectorAll('.markdown')");
     expect(capturedExpression).not.toContain("document.querySelectorAll('.markdown')");
@@ -1733,9 +2573,362 @@ describe("waitForAssistantResponse", () => {
     expect(result.text).toBe("Recovered assistant response.");
     expect(evaluate).toHaveBeenCalled();
   });
+
+  test("does not spend a second full timeout after the response observer times out", async () => {
+    vi.useFakeTimers();
+    try {
+      const evaluate = vi.fn().mockImplementation((params: { awaitPromise?: boolean }) => {
+        if (params?.awaitPromise) {
+          return new Promise((_resolve, reject) => {
+            setTimeout(() => reject(new Error("Response timeout")), 1_500);
+          });
+        }
+        return Promise.resolve({ result: { value: null } });
+      });
+      let outcome:
+        | { status: "pending" }
+        | { status: "rejected"; message: string }
+        | { status: "resolved" } = { status: "pending" };
+      const tracked = waitForAssistantResponse(
+        { evaluate } as unknown as ChromeClient["Runtime"],
+        2_000,
+        logger,
+      ).then(
+        () => {
+          outcome = { status: "resolved" };
+        },
+        (error: unknown) => {
+          outcome = {
+            status: "rejected",
+            message: error instanceof Error ? error.message : String(error),
+          };
+        },
+      );
+      await vi.advanceTimersByTimeAsync(2_600);
+      expect(outcome).toEqual({ status: "rejected", message: "Response timeout" });
+      await tracked;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not finish a streaming answer just because its html contains an estuary file URL", async () => {
+    vi.useFakeTimers();
+    try {
+      const streaming = {
+        text: "Here is the chart so far.",
+        html: '<p>Here is the chart so far.</p><img src="https://chatgpt.com/backend-api/estuary/content?id=file_abc">',
+        messageId: "mid",
+        turnId: "tid",
+      };
+      const evaluate = vi
+        .fn()
+        .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+          if (params.awaitPromise) {
+            return { result: { type: "object", value: streaming } };
+          }
+          const expression = String(params.expression ?? "");
+          if (expression.includes("extractAssistantTurn")) {
+            return { result: { value: streaming } };
+          }
+          if (expression.includes("Find the LAST assistant turn")) {
+            return { result: { value: false } };
+          }
+          return { result: { value: false } };
+        });
+      let outcome: "pending" | "resolved" | "rejected" = "pending";
+      const tracked = waitForAssistantResponse(
+        { evaluate } as unknown as ChromeClient["Runtime"],
+        2_000,
+        logger,
+      ).then(
+        () => {
+          outcome = "resolved";
+        },
+        () => {
+          outcome = "rejected";
+        },
+      );
+      await vi.advanceTimersByTimeAsync(500);
+      expect(outcome).toBe("pending");
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(outcome).toBe("rejected");
+      await tracked;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test.each(["Generated image.", "Generated 3 images."])(
+    "still accepts an image-only extractor result %j without an action bar",
+    async (text) => {
+      vi.useFakeTimers();
+      try {
+        const imageOnly = {
+          text,
+          html: '<img src="https://chatgpt.com/backend-api/estuary/content?id=file_abc">',
+          messageId: "mid",
+          turnId: "tid",
+        };
+        const evaluate = vi
+          .fn()
+          .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+            if (params.awaitPromise) {
+              return { result: { type: "object", value: imageOnly } };
+            }
+            const expression = String(params.expression ?? "");
+            if (expression.includes("extractAssistantTurn")) {
+              return { result: { value: imageOnly } };
+            }
+            if (expression.includes("Find the LAST assistant turn")) {
+              return { result: { value: false } };
+            }
+            return { result: { value: false } };
+          });
+        const promise = waitForAssistantResponse(
+          { evaluate } as unknown as ChromeClient["Runtime"],
+          5_000,
+          logger,
+        );
+        await vi.advanceTimersByTimeAsync(2_000);
+        await expect(promise).resolves.toMatchObject({ text });
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+});
+
+describe("composer attachment menu safety", () => {
+  test("captures the pre-attachment page identity", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: { value: "https://chatgpt.com/g/project-example" },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(attachments.captureComposerNavigationUrl(runtime)).resolves.toBe(
+      "https://chatgpt.com/g/project-example",
+    );
+  });
+
+  test("fails closed when the pre-attachment page identity cannot be captured", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({ result: { value: null } }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(attachments.captureComposerNavigationUrl(runtime)).rejects.toMatchObject({
+      name: "BrowserAutomationError",
+      details: expect.objectContaining({
+        code: "attachment-navigation-identity-unavailable",
+        stage: "upload-attachment",
+      }),
+    });
+  });
+
+  test("activates only the exact plus control with a trusted keyboard event", async () => {
+    const evaluate = vi.fn().mockResolvedValue({
+      result: {
+        value: {
+          status: "focused",
+          startUrl: "https://chatgpt.com/",
+          focused: true,
+          currentUrl: "https://chatgpt.com/",
+          sawKeyDown: true,
+        },
+      },
+    });
+    const dispatchKeyEvent = vi.fn().mockResolvedValue(undefined);
+    const dispatchMouseEvent = vi.fn().mockResolvedValue(undefined);
+    const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
+    const input = {
+      dispatchKeyEvent,
+      dispatchMouseEvent,
+    } as unknown as ChromeClient["Input"];
+
+    await expect(attachments.activateComposerPlus(runtime, input)).resolves.toEqual({
+      method: "trusted-keyboard",
+      startUrl: "https://chatgpt.com/",
+    });
+
+    expect(dispatchKeyEvent).toHaveBeenCalledTimes(2);
+    expect(dispatchKeyEvent).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ type: "keyDown", key: "Enter", code: "Enter" }),
+    );
+    expect(dispatchKeyEvent).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ type: "keyUp", key: "Enter", code: "Enter" }),
+    );
+    expect(dispatchMouseEvent).not.toHaveBeenCalled();
+
+    const expression = String(evaluate.mock.calls[0]?.[0]?.expression ?? "");
+    expect(expression).toContain("#composer-plus-btn");
+    expect(expression).toContain(JSON.stringify('button[data-testid="composer-plus-btn"]'));
+    expect(expression).toContain(
+      JSON.stringify('button[data-composer-navigation-target="add-context"]'),
+    );
+    expect(expression).not.toContain('[data-testid*="plus"]');
+    expect(expression).not.toContain('button[aria-label^="add" i]');
+    expect(expression).not.toContain("getBoundingClientRect().left");
+  });
+
+  test("fails closed before activation when Work is selected", async () => {
+    const dispatchKeyEvent = vi.fn();
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: {
+            status: "work-selected",
+            startUrl: "https://chatgpt.com/",
+          },
+        },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+    const input = { dispatchKeyEvent } as unknown as ChromeClient["Input"];
+
+    const error = await attachments.activateComposerPlus(runtime, input).catch((cause) => cause);
+
+    expect(error).toBeInstanceOf(BrowserAutomationError);
+    expect((error as BrowserAutomationError).details).toMatchObject({
+      code: "attachment-control-work-mode",
+      stage: "upload-attachment",
+    });
+    expect(dispatchKeyEvent).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["root to a new conversation", "https://chatgpt.com/", "https://chatgpt.com/c/WEB:new-work"],
+    [
+      "root to a project landing",
+      "https://chatgpt.com/",
+      "https://chatgpt.com/g/g-project-b/project",
+    ],
+    [
+      "one project landing to another",
+      "https://chatgpt.com/g/g-project-a/project",
+      "https://chatgpt.com/g/g-project-b/project",
+    ],
+    [
+      "project conversation to another conversation",
+      "https://chatgpt.com/g/g-example/project/c/chat-a",
+      "https://chatgpt.com/g/g-example/project/c/chat-b",
+    ],
+  ])("rejects unexpected navigation from %s", async (_caseName, startUrl, currentUrl) => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: { value: { currentUrl, workSelected: false } },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    const error = await attachments
+      .assertComposerPlusStayedInPlace(runtime, startUrl)
+      .catch((cause) => cause);
+
+    expect(error).toBeInstanceOf(BrowserAutomationError);
+    expect((error as BrowserAutomationError).details).toMatchObject({
+      code: "attachment-control-unexpected-navigation",
+      stage: "upload-attachment",
+      startUrl,
+      currentUrl,
+    });
+  });
+
+  test.each([
+    [
+      "root URL query/hash rewrite",
+      "https://chatgpt.com/?model=gpt-5.6-sol",
+      "https://chatgpt.com/#temporary-chat",
+    ],
+    [
+      "same project landing with trailing slash and query rewrite",
+      "https://chatgpt.com/g/g-example/project/?model=gpt-5.6-sol",
+      "https://chatgpt.com/g/g-example/project#composer",
+    ],
+  ])(
+    "accepts a stable non-conversation context after %s",
+    async (_caseName, startUrl, currentUrl) => {
+      const runtime = {
+        evaluate: vi.fn().mockResolvedValue({
+          result: { value: { currentUrl, workSelected: false } },
+        }),
+      } as unknown as ChromeClient["Runtime"];
+
+      await expect(
+        attachments.assertComposerPlusStayedInPlace(runtime, startUrl),
+      ).resolves.toBeUndefined();
+    },
+  );
+
+  test("accepts a project-scoped URL rewrite that preserves the conversation id", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: {
+            currentUrl: "https://chatgpt.com/g/g-example/project/c/chat-same",
+            workSelected: false,
+          },
+        },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      attachments.assertComposerPlusStayedInPlace(runtime, "https://chatgpt.com/c/chat-same"),
+    ).resolves.toBeUndefined();
+  });
+
+  test("rejects Work state even when the conversation URL is unchanged", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: {
+            currentUrl: "https://chatgpt.com/c/chat-same",
+            workSelected: true,
+          },
+        },
+      }),
+    } as unknown as ChromeClient["Runtime"];
+
+    await expect(
+      attachments.assertComposerPlusStayedInPlace(runtime, "https://chatgpt.com/c/chat-same"),
+    ).rejects.toThrow(/navigated to Work/i);
+  });
 });
 
 describe("uploadAttachmentFile", () => {
+  const withStableNavigation = (runtime: ChromeClient["Runtime"]): ChromeClient["Runtime"] => ({
+    ...runtime,
+    evaluate: (params) => {
+      const expression = String(params.expression ?? "");
+      if (expression.includes("__oracleAttachmentInputGuards"))
+        return Promise.resolve({
+          result: {
+            type: "object",
+            value: expression.includes("const summary =") ? { blocked: null } : { installed: true },
+          },
+        });
+      if (expression.includes("return { blocked: guard.blocked }")) {
+        return Promise.resolve(runtime.evaluate(params)).then(() => ({
+          result: { type: "object" as const, value: { blocked: null } },
+        }));
+      }
+      if (expression.includes("const startUrl = navigation.currentUrl"))
+        return Promise.resolve({
+          result: {
+            type: "object",
+            value: { status: "missing", startUrl: "https://chatgpt.com/" },
+          },
+        });
+      if (expression.includes("currentUrl: location.href"))
+        return Promise.resolve({
+          result: {
+            type: "object",
+            value: { currentUrl: "https://chatgpt.com/", workSelected: false },
+          },
+        });
+      return runtime.evaluate(params);
+    },
+  });
   let transferSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
@@ -1748,26 +2941,59 @@ describe("uploadAttachmentFile", () => {
     transferSpy.mockRestore();
   });
 
-  test.skip("selects DOM input and uploads file", async () => {
+  test("selects DOM input and uploads file", async () => {
     logger.mockClear();
-    vi.spyOn(attachments, "waitForAttachmentVisible").mockResolvedValue(undefined);
+    let uploaded = false;
     const dom = {
       getDocument: vi.fn().mockResolvedValue({ root: { nodeId: 1 } }),
       querySelector: vi.fn().mockResolvedValue({ nodeId: 2 }),
-      setFileInputFiles: vi.fn().mockResolvedValue(undefined),
+      setFileInputFiles: vi.fn(async () => {
+        uploaded = true;
+      }),
     } as unknown as ChromeClient["DOM"];
     const runtime = {
-      evaluate: vi.fn().mockResolvedValue({ result: { value: { matched: true, found: true } } }),
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        if (
+          expression.includes("const normalizedExpected") &&
+          expression.includes("chipSignature")
+        ) {
+          return {
+            result: {
+              value: {
+                ui: uploaded,
+                input: uploaded,
+                chipCount: uploaded ? 1 : 0,
+                inputCount: uploaded ? 1 : 0,
+                uploading: false,
+                chipSignature: uploaded ? "foo.md" : "",
+              },
+            },
+          };
+        }
+        if (expression.includes("baselineChipCount") && expression.includes("baselineChips")) {
+          return {
+            result: {
+              value: { ok: true, baselineChipCount: 0, baselineChips: [], order: [0] },
+            },
+          };
+        }
+        if (expression.includes("const matchesExpectedFileName =")) {
+          return { result: { value: { found: uploaded } } };
+        }
+        return { result: { value: null } };
+      }),
     } as unknown as ChromeClient["Runtime"];
     await expect(
       uploadAttachmentFile(
-        { runtime, dom },
+        { runtime: withStableNavigation(runtime), dom },
         { path: "/tmp/foo.md", displayPath: "foo.md" },
         logger,
       ),
     ).resolves.toBe(true);
     expect(dom.querySelector).toHaveBeenCalled();
     expect(dom.setFileInputFiles).toHaveBeenCalledWith({ nodeId: 2, files: ["/tmp/foo.md"] });
+    expect(dom.setFileInputFiles).toHaveBeenCalledTimes(1);
+    expect(transferSpy).not.toHaveBeenCalled();
     expect(logger).toHaveBeenCalledWith(expect.stringContaining("Attachment queued"));
   }, 15_000);
 
@@ -1781,7 +3007,7 @@ describe("uploadAttachmentFile", () => {
     } as unknown as ChromeClient["Runtime"];
     await expect(
       uploadAttachmentFile(
-        { runtime, dom },
+        { runtime: withStableNavigation(runtime), dom },
         { path: "/tmp/foo.md", displayPath: "foo.md" },
         logger,
       ),
@@ -1809,7 +3035,7 @@ describe("uploadAttachmentFile", () => {
 
     await expect(
       uploadAttachmentFile(
-        { runtime, dom },
+        { runtime: withStableNavigation(runtime), dom },
         { path: "/tmp/SettingsStore.swift", displayPath: "SettingsStore.swift" },
         logger,
       ),
@@ -1861,7 +3087,7 @@ describe("uploadAttachmentFile", () => {
 
     await expect(
       uploadAttachmentFile(
-        { runtime, dom },
+        { runtime: withStableNavigation(runtime), dom },
         { path: "/tmp/oracle-browser-smoke.txt", displayPath: "oracle-browser-smoke.txt" },
         logger,
       ),
@@ -1902,7 +3128,7 @@ describe("uploadAttachmentFile", () => {
 
     await expect(
       uploadAttachmentFile(
-        { runtime, dom },
+        { runtime: withStableNavigation(runtime), dom },
         { path: "/tmp/oracle-browser-smoke.txt", displayPath: "oracle-browser-smoke.txt" },
         logger,
         { expectedCount: 1 },
@@ -1944,7 +3170,7 @@ describe("uploadAttachmentFile", () => {
 
     await expect(
       uploadAttachmentFile(
-        { runtime, dom },
+        { runtime: withStableNavigation(runtime), dom },
         { path: "/tmp/oracle-browser-smoke.txt", displayPath: "oracle-browser-smoke.txt" },
         logger,
         { expectedCount: 1 },
@@ -2024,7 +3250,7 @@ describe("uploadAttachmentFile", () => {
 
     await expect(
       uploadAttachmentFile(
-        { runtime, dom },
+        { runtime: withStableNavigation(runtime), dom },
         { path: "/tmp/oracle-browser-smoke.txt", displayPath: "oracle-browser-smoke.txt" },
         logger,
       ),
@@ -2117,7 +3343,7 @@ describe("uploadAttachmentFile", () => {
 
     vi.useFakeTimers();
     const uploadPromise = uploadAttachmentFile(
-      { runtime, dom },
+      { runtime: withStableNavigation(runtime), dom },
       { path: "/tmp/oracle-browser-smoke.txt", displayPath: "oracle-browser-smoke.txt" },
       logger,
     );
@@ -2210,7 +3436,7 @@ describe("uploadAttachmentFile", () => {
     vi.useFakeTimers();
     try {
       const uploadPromise = uploadAttachmentFile(
-        { runtime, dom },
+        { runtime: withStableNavigation(runtime), dom },
         { path: "/tmp/case412.jpg", displayPath: "case412.jpg" },
         logger,
       );
@@ -2310,7 +3536,7 @@ describe("uploadAttachmentFile", () => {
     vi.useFakeTimers();
     try {
       const uploadPromise = uploadAttachmentFile(
-        { runtime, dom },
+        { runtime: withStableNavigation(runtime), dom },
         { path: "/tmp/case412.jpg", displayPath: "case412.jpg" },
         logger,
       );
@@ -2400,7 +3626,7 @@ describe("uploadAttachmentFile", () => {
 
     vi.useFakeTimers();
     const uploadPromise = uploadAttachmentFile(
-      { runtime, dom },
+      { runtime: withStableNavigation(runtime), dom },
       { path: "/tmp/oracle-browser-smoke.txt", displayPath: "oracle-browser-smoke.txt" },
       logger,
     );
@@ -2412,7 +3638,19 @@ describe("uploadAttachmentFile", () => {
 
     expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toMatch(/Attachment did not register/i);
-    expect(dom.setFileInputFiles).toHaveBeenCalledWith({ nodeId: 2, files: [] });
+    const clearCall = vi
+      .mocked(runtime.evaluate)
+      .mock.calls.findIndex(
+        ([params]) =>
+          params.expression.includes("input.value = ''") &&
+          params.expression.includes(
+            JSON.stringify('input[type="file"][data-oracle-upload-idx="0"]'),
+          ),
+      );
+    expect(clearCall).toBeGreaterThanOrEqual(0);
+    expect(vi.mocked(runtime.evaluate).mock.invocationCallOrder[clearCall]).toBeLessThan(
+      vi.mocked(dom.setFileInputFiles).mock.invocationCallOrder[1],
+    );
   });
 
   test("does not use a file-count-only signal as upload confirmation", async () => {
@@ -2486,7 +3724,7 @@ describe("uploadAttachmentFile", () => {
 
     vi.useFakeTimers();
     const uploadPromise = uploadAttachmentFile(
-      { runtime, dom },
+      { runtime: withStableNavigation(runtime), dom },
       { path: "/tmp/oracle-browser-smoke.txt", displayPath: "oracle-browser-smoke.txt" },
       logger,
     );

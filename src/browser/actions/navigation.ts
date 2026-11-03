@@ -4,6 +4,7 @@ import {
   CLOUDFLARE_TITLE,
   CONVERSATION_TURN_SELECTOR,
   INPUT_SELECTORS,
+  PRE_HYDRATION_PROMPT_SELECTOR,
 } from "../constants.js";
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
@@ -51,15 +52,79 @@ export function installJavaScriptDialogAutoDismissal(
   };
 }
 
+const NAVIGATION_READY_TIMEOUT_MS = 45_000;
+
+// Learned: a fresh tab's first navigation can fail (Page.navigate errorText) or leave the tab on
+// about:blank or a chrome-error page, which still reports readyState "complete". Without a check
+// the login probe then runs on a page that is not ChatGPT and reports a missing session. A second
+// navigation usually loads, so retry once before failing.
 export async function navigateToChatGPT(
   Page: ChromeClient["Page"],
   Runtime: ChromeClient["Runtime"],
   url: string,
   logger: BrowserLogger,
 ) {
-  logger(`Navigating to ${url}`);
-  await Page.navigate({ url });
-  await waitForDocumentReady(Runtime, 45_000);
+  logger(`Navigating to ${formatDiagnosticUrl(url)}`);
+  const first = await navigateOnce(Page, Runtime, url);
+  if (first.loaded) return;
+  logger(
+    `[browser] Page did not load (${first.reason}); retrying navigation to ${formatDiagnosticUrl(url)} once.`,
+  );
+  const retry = await navigateOnce(Page, Runtime, url);
+  if (retry.loaded) {
+    logger("[browser] Page loaded on navigation retry.");
+    return;
+  }
+  const nextStep = `Check that ${formatDiagnosticUrl(url)} opens in that Chrome window, then rerun.`;
+  throw new BrowserAutomationError(
+    retry.timedOut
+      ? `Page did not reach ready state in time (${retry.reason}), including one navigation retry. ${nextStep}`
+      : `Page did not load (${retry.reason}), including one navigation retry. ${nextStep}`,
+    { stage: "navigation", details: { url: formatDiagnosticUrl(url), reason: retry.reason } },
+  );
+}
+
+type NavigationAttempt = { loaded: true } | { loaded: false; timedOut: boolean; reason: string };
+
+async function navigateOnce(
+  Page: ChromeClient["Page"],
+  Runtime: ChromeClient["Runtime"],
+  url: string,
+): Promise<NavigationAttempt> {
+  const result = (await Page.navigate({ url })) as { errorText?: string } | undefined;
+  const errorText = result?.errorText;
+  // ERR_ABORTED also means a newer navigation (an auth hop, a page redirect) took over this one;
+  // re-requesting the URL at once would interrupt it, so judge the tab by its readiness instead.
+  if (errorText && errorText !== "net::ERR_ABORTED") {
+    return { loaded: false, timedOut: false, reason: `navigation failed: ${errorText}` };
+  }
+  const ready = await waitForDocumentReady(Runtime, NAVIGATION_READY_TIMEOUT_MS, url);
+  if (ready.loaded || !errorText) return ready;
+  return {
+    ...ready,
+    timedOut: false,
+    reason: `navigation aborted (${errorText}); ${ready.reason}`,
+  };
+}
+
+function isWebUrl(value: string | null | undefined): boolean {
+  return typeof value === "string" && /^https?:\/\//i.test(value);
+}
+
+// Printed URLs keep scheme, host and path only: auth URLs carry account hints and state values
+// in their query and fragment, and these lines and error details reach normal output (the
+// always-printed lines, Project Sources logs, `oracle session` error metadata).
+function formatDiagnosticUrl(value: string | null | undefined): string {
+  if (typeof value !== "string" || !value) return "n/a";
+  if (isWebUrl(value)) {
+    try {
+      const parsed = new URL(value);
+      return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+    } catch {
+      return "(unparsable URL)";
+    }
+  }
+  return value.split(/[?#]/)[0].slice(0, 80);
 }
 
 export interface PromptReadyNavigationOptions {
@@ -97,10 +162,10 @@ async function dismissBlockingUi(
       const buttonCandidates = (root) =>
         Array.from(root.querySelectorAll('button,[role="button"],a')).filter((el) => isVisible(el));
 
-      const roots = [
-        ...Array.from(document.querySelectorAll('[role="dialog"],dialog')),
-        document.body,
-      ].filter(Boolean);
+      // Only visible dialogs: a page-wide scan clicks sidebar chats titled like dismiss controls.
+      const roots = Array.from(document.querySelectorAll('[role="dialog"],dialog')).filter((el) =>
+        isVisible(el),
+      );
       for (const root of roots) {
         const buttons = buttonCandidates(root);
         const close = buttons.find((el) => labelFor(el).includes('close'));
@@ -197,6 +262,7 @@ function buildChatModeProbeExpression(): string {
       return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
     };
     const isSelected = (node) =>
+      node?.getAttribute?.('aria-pressed') === 'true' ||
       node?.getAttribute?.('aria-checked') === 'true' ||
       node?.getAttribute?.('data-state') === 'on';
     const conversationIdFromPath = (value) => {
@@ -216,9 +282,9 @@ function buildChatModeProbeExpression(): string {
     const conversationId = conversationIdFromPath(pathname);
     if (conversationId) {
       // Conversation messages can contain same-origin links to the current thread. Only sidebar
-      // history items use ChatGPT's renderer-owned menu-item anchor class.
+      // history items belong to navigation or carry the legacy menu-item marker.
       const activeHistoryLinks = Array.from(
-        document.querySelectorAll('a.__menu-item[href*="/c/"]'),
+        document.querySelectorAll('a.__menu-item[href*="/c/"], nav a[href*="/c/"]'),
       ).filter((node) => {
         try {
           const candidateUrl = new URL(node.getAttribute('href') || '', location.origin);
@@ -229,14 +295,14 @@ function buildChatModeProbeExpression(): string {
       });
       if (activeHistoryLinks.length > 0) {
         const hasWorkBadge = activeHistoryLinks.some((link) =>
-          Array.from(link.querySelectorAll('span')).some(isStructuredWorkBadge),
+          Array.from(link.querySelectorAll('span')).some(node => isStructuredWorkBadge(node) || (normalize(node.textContent) === 'work' && node.childElementCount === 0 && !node.closest('[data-thread-title]') && Boolean(link.querySelector('[data-thread-title]')))),
         );
         if (hasWorkBadge) return { status: 'work-conversation' };
 
         const ariaLabels = activeHistoryLinks
           .map((link) => normalize(link.getAttribute('aria-label')))
           .filter(Boolean);
-        if (ariaLabels.length === 0 || ariaLabels.some((aria) => /,\\s*work\\s*$/.test(aria))) {
+        if ((ariaLabels.length === 0 && !activeHistoryLinks.some(link => link.querySelector('[data-thread-title]'))) || ariaLabels.some((aria) => /,\\s*work\\s*$/.test(aria))) {
           return { status: 'conversation-unresolved' };
         }
         return { status: 'chat-conversation' };
@@ -244,6 +310,17 @@ function buildChatModeProbeExpression(): string {
       return { status: 'conversation-unresolved' };
     }
 
+    const modeGroup = document.querySelector('[role="group"][aria-label="Composer mode"]');
+    const modeButtons = modeGroup ? Array.from(modeGroup.querySelectorAll('button')).filter(isVisible) : [];
+    const selectedMode = modeButtons.find(isSelected);
+    if (normalize(selectedMode?.textContent) === 'chat') return { status: 'chat-selected' };
+    if (normalize(selectedMode?.textContent) === 'work') {
+      const chatButton = modeButtons.find(node => normalize(node.textContent) === 'chat');
+      if (chatButton) {
+        const rect = chatButton.getBoundingClientRect();
+        return { status: 'work-selected', chatPoint: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } };
+      }
+    }
     const radios = Array.from(document.querySelectorAll('button[role="radio"]')).filter(isVisible);
     const chat = radios.find((node) => normalize(node.textContent) === 'chat');
     const work = radios.find((node) => normalize(node.textContent) === 'work');
@@ -417,11 +494,14 @@ export async function ensureLoggedIn(
     return;
   }
 
+  if (isPageNotLoadedProbe(probe)) throwPageNotLoaded(probe, logger);
+
   const welcomeBack = await attemptWelcomeBackLogin(
     Runtime,
     logger,
     preferredChatGptAccountEmail(),
   );
+  let lastProbe = probe;
   if (welcomeBack.accepted) {
     // Learned: "Welcome back" account picker needs a click even when cookies are valid,
     // and the redirect can lag, so re-probe before failing hard.
@@ -436,26 +516,16 @@ export async function ensureLoggedIn(
       logger("Login restored via Welcome back account picker");
       return;
     }
-    logger(
-      `Login retry after Welcome back failed (sessionStatus=${retryProbe.status}, sessionAuthenticated=${Boolean(
-        retryProbe.sessionAuthenticated,
-      )}, backendStatus=${retryProbe.backendStatus ?? "n/a"}, domLoginCta=${Boolean(
-        retryProbe.domLoginCta,
-      )}, appAuthenticated=${Boolean(retryProbe.appAuthenticated)})`,
-    );
+    if (isPageNotLoadedProbe(retryProbe))
+      throwPageNotLoaded(retryProbe, logger, " after Welcome back");
+    lastProbe = retryProbe;
   }
 
   logger(
-    `Login probe failed (sessionStatus=${probe.status}, sessionAuthenticated=${Boolean(
-      probe.sessionAuthenticated,
-    )}, sessionResolved=${Boolean(probe.sessionResolved)}, backendStatus=${probe.backendStatus ?? "n/a"}, domLoginCta=${Boolean(
-      probe.domLoginCta,
-    )}, onAuthPage=${Boolean(probe.onAuthPage)}, appAuthenticated=${Boolean(
-      probe.appAuthenticated,
-    )}, cfBlocked=${Boolean(probe.cfBlocked)}, url=${probe.pageUrl ?? "n/a"}, error=${probe.error ?? "none"})`,
+    `[browser] Login probe failed${lastProbe === probe ? "" : " after Welcome back"} ${formatLoginProbeDetail(lastProbe)}`,
   );
 
-  const domLabel = probe.domLoginCta ? " Login button detected on page." : "";
+  const domLabel = lastProbe.domLoginCta ? " Login button detected on page." : "";
   const cookieHint = options.remoteSession
     ? "The remote Chrome session is not signed into ChatGPT. Sign in there, then rerun."
     : (options.appliedCookies ?? 0) === 0
@@ -635,7 +705,7 @@ export interface ResumedConversationHydrationDeps {
   expectedConversationUrl?: string;
 }
 
-function conversationIdFromUrl(value: string | undefined): string | null {
+export function conversationIdFromUrl(value: string | undefined): string | null {
   if (!value) return null;
   try {
     return new URL(value).pathname.match(/(?:^|\/)c\/([^/]+)/)?.[1] ?? null;
@@ -736,19 +806,50 @@ export async function waitForResumedConversationHydration(
   return priorTurns;
 }
 
-async function waitForDocumentReady(Runtime: ChromeClient["Runtime"], timeoutMs: number) {
+async function waitForDocumentReady(
+  Runtime: ChromeClient["Runtime"],
+  timeoutMs: number,
+  targetUrl: string,
+): Promise<NavigationAttempt> {
+  // A web target is ready only once a web document is: about:blank and chrome-error pages are
+  // "complete" at once.
+  const requireWebPage = isWebUrl(targetUrl);
   const start = Date.now();
+  let readyState = "unknown";
+  let href: string | null = null;
   while (Date.now() - start < timeoutMs) {
-    const { result } = await Runtime.evaluate({
-      expression: `document.readyState`,
-      returnByValue: true,
-    });
-    if (result?.value === "complete" || result?.value === "interactive") {
-      return;
+    try {
+      const { result } = await Runtime.evaluate({
+        expression: `({ readyState: document.readyState, href: typeof location === "object" ? location.href : null })`,
+        returnByValue: true,
+      });
+      const value = result?.value as { readyState?: unknown; href?: unknown } | undefined;
+      readyState = typeof value?.readyState === "string" ? value.readyState : "unknown";
+      href = typeof value?.href === "string" ? value.href : null;
+      if (
+        (readyState === "complete" || readyState === "interactive") &&
+        (!requireWebPage || isWebUrl(href))
+      ) {
+        return { loaded: true };
+      }
+    } catch (error) {
+      // The execution context is replaced while the navigation commits ("Inspected target
+      // navigated or closed" is also a navigation interruption); keep polling then, but let a
+      // dropped connection fail at once. A closed target still ends at the deadline.
+      const message = error instanceof Error ? error.message : String(error);
+      if (
+        !/execution context|cannot find context|inspected target navigated or closed/i.test(message)
+      ) {
+        throw error;
+      }
     }
     await delay(100);
   }
-  throw new Error("Page did not reach ready state in time");
+  return {
+    loaded: false,
+    timedOut: true,
+    reason: `readyState=${readyState}, url=${formatDiagnosticUrl(href)}`,
+  };
 }
 
 async function currentUrl(Runtime: ChromeClient["Runtime"]): Promise<string | null> {
@@ -762,7 +863,8 @@ async function currentUrl(Runtime: ChromeClient["Runtime"]): Promise<string | nu
 function isAuthLoginUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
-    if (parsed.hostname.includes("auth.openai.com")) {
+    const host = parsed.hostname.replace(/\.$/, "").toLowerCase();
+    if (host === "auth.openai.com" || host.endsWith(".auth.openai.com")) {
       return true;
     }
     return /^\/log-?in/i.test(parsed.pathname);
@@ -780,10 +882,12 @@ async function waitForPrompt(
     const { result } = await Runtime.evaluate({
       expression: `(() => {
         const selectors = ${JSON.stringify(INPUT_SELECTORS)};
+        const placeholder = ${JSON.stringify(PRE_HYDRATION_PROMPT_SELECTOR)};
         for (const selector of selectors) {
-          const node = document.querySelector(selector);
-          if (node && !node.hasAttribute('disabled')) {
-            return true;
+          for (const node of document.querySelectorAll(selector)) {
+            if (!node.hasAttribute('disabled') && !node.matches(placeholder)) {
+              return true;
+            }
           }
         }
         return false;
@@ -816,7 +920,7 @@ export function buildCloudflareVerdictExpression(): string {
       title.includes(${JSON.stringify(CLOUDFLARE_TITLE.toLowerCase())}) ||
       (title.includes('attention required') && title.includes('cloudflare'));
     const hasAppShell = Boolean(document.querySelector(
-      '#prompt-textarea, [data-testid="prompt-textarea"], [data-testid^="conversation-turn"], [data-testid="profile-button"], main form[data-type], nav a[href*="/c/"]'
+      'form[data-chatgpt-composer], [data-turn-key], #prompt-textarea, [data-testid="prompt-textarea"], [data-testid^="conversation-turn"], [data-testid="profile-button"], main form[data-type], nav a[href*="/c/"]'
     ));
     const bodyText = String((document.body && document.body.innerText) || '')
       .toLowerCase().replace(/\\s+/g, ' ').trim();
@@ -900,6 +1004,7 @@ type LoginProbeResult = {
   redirected?: boolean;
   error?: string | null;
   pageUrl?: string | null;
+  readyState?: string | null;
   domLoginCta?: boolean;
   onAuthPage?: boolean;
   appAuthenticated?: boolean;
@@ -1148,7 +1253,10 @@ function buildLoginProbeExpression(timeoutMs: number): string {
       classification = classifyAuth(auth, appAuthenticated);
     }
 
-    const loginSignals = domLoginCta || onAuthPage;
+    // A stray login link must not veto both cookie-session and authenticated-app proof.
+    // Keep login controls authoritative when either signal is missing, or on auth routes.
+    const authenticatedApp = auth.session.authenticated && appAuthenticated;
+    const loginSignals = onAuthPage || (domLoginCta && !authenticatedApp);
     const backendStatus = auth.backend ? auth.backend.status : null;
     const cfBlocked = auth.session.cfBlocked || Boolean(auth.backend?.cfBlocked);
     const error = auth.session.error || auth.backend?.error || null;
@@ -1156,6 +1264,7 @@ function buildLoginProbeExpression(timeoutMs: number): string {
     return {
       ok,
       status: auth.session.status,
+      readyState: typeof document.readyState === 'string' ? document.readyState : null,
       backendStatus,
       redirected: false,
       url: pageUrl,
@@ -1191,6 +1300,7 @@ function normalizeLoginProbe(raw: unknown): LoginProbeResult {
     redirected: Boolean(value.redirected),
     error: typeof value.error === "string" ? value.error : null,
     pageUrl: typeof value.pageUrl === "string" ? value.pageUrl : null,
+    readyState: typeof value.readyState === "string" ? value.readyState : null,
     domLoginCta: Boolean(value.domLoginCta),
     onAuthPage: Boolean(value.onAuthPage),
     appAuthenticated: Boolean(value.appAuthenticated),
@@ -1199,6 +1309,32 @@ function normalizeLoginProbe(raw: unknown): LoginProbeResult {
     sessionAuthenticated: Boolean(value.sessionAuthenticated),
     sessionResolved: Boolean(value.sessionResolved),
   };
+}
+
+function formatLoginProbeDetail(probe: LoginProbeResult): string {
+  return `(sessionStatus=${probe.status}, sessionAuthenticated=${Boolean(
+    probe.sessionAuthenticated,
+  )}, sessionResolved=${Boolean(probe.sessionResolved)}, backendStatus=${probe.backendStatus ?? "n/a"}, domLoginCta=${Boolean(
+    probe.domLoginCta,
+  )}, onAuthPage=${Boolean(probe.onAuthPage)}, appAuthenticated=${Boolean(
+    probe.appAuthenticated,
+  )}, cfBlocked=${Boolean(probe.cfBlocked)}, url=${formatDiagnosticUrl(probe.pageUrl)}, readyState=${probe.readyState ?? "n/a"}, error=${probe.error ?? "none"})`;
+}
+
+// Only a tab that is not on a web document (about:blank, a chrome-error page) is known not to
+// have loaded. Failed fetches on a web page are not enough: a rendered sign-in page or account
+// picker whose requests fail must still reach the sign-in path. A document still loading can be
+// a sign-in redirect in progress, so readyState is only reported.
+function isPageNotLoadedProbe(probe: LoginProbeResult): boolean {
+  return typeof probe.pageUrl === "string" && !isWebUrl(probe.pageUrl);
+}
+
+function throwPageNotLoaded(probe: LoginProbeResult, logger: BrowserLogger, when = ""): never {
+  logger(`[browser] Login probe failed${when} ${formatLoginProbeDetail(probe)}`);
+  throw new BrowserAutomationError(
+    `ChatGPT page did not load${when} (url=${formatDiagnosticUrl(probe.pageUrl)}, error=${probe.error ?? "none"}), so Oracle could not check the login; rerun the command.`,
+    { stage: "chatgpt-page-not-loaded", details: { pageUrl: formatDiagnosticUrl(probe.pageUrl) } },
+  );
 }
 
 export function buildLoginProbeExpressionForTest(timeoutMs = LOGIN_CHECK_TIMEOUT_MS): string {

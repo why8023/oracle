@@ -6,6 +6,7 @@ import {
   buildMarkdownFallbackExtractorForTest,
   buildCopyExpressionForTest,
   buildUserTurnAttachmentExpressionForTest,
+  isAssistantTurnUiErrorText,
 } from "../../src/browser/pageActions.ts";
 import {
   CONVERSATION_TURN_CONTAINER_SELECTOR,
@@ -14,6 +15,28 @@ import {
 } from "../../src/browser/constants.ts";
 
 describe("browser automation expressions", () => {
+  test("classifies only a failed assistant turn with a visible Retry control", () => {
+    expect(isAssistantTurnUiErrorText("Something went wrong.", true)).toBe(true);
+    expect(isAssistantTurnUiErrorText("Something went wrong.", false)).toBe(false);
+    expect(isAssistantTurnUiErrorText("Retry the calculation with another input.", true)).toBe(
+      false,
+    );
+  });
+
+  test.each([true, false])("recognizes terminal thinking failure with Retry=%s", (retry) => {
+    expect(isAssistantTurnUiErrorText("Thinking failed", retry)).toBe(true);
+    expect(
+      isAssistantTurnUiErrorText("Thinking failed.\nIs this conversation helpful so far?", retry),
+    ).toBe(true);
+    expect(isAssistantTurnUiErrorText("Thinking failed\nRetry", retry)).toBe(true);
+    expect(
+      isAssistantTurnUiErrorText('The UI says "Thinking failed" when a request fails.', retry),
+    ).toBe(false);
+    expect(isAssistantTurnUiErrorText("Thinking failed to account for this case.", retry)).toBe(
+      false,
+    );
+  });
+
   test("assistant extractor references constants", () => {
     const expression = buildAssistantExtractorForTest("capture");
     expect(expression).toContain(JSON.stringify(CONVERSATION_TURN_SELECTOR));
