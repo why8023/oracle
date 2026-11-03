@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Deep Research: retain downloaded reports and comparison exports alongside opt-in provider conversation evidence, including links in the saved transcript.
 - Browser: recognize current ChatGPT composer controls, scoped Web Search menu rows, and semantic search pills; support English and Simplified Chinese labels while preserving navigation and full-prompt verification. Thanks @xiaozhi747 (#608).
 
 - Dependencies: update dotenv, the MCP SDK 1.x development client, and es-toolkit after the two-day cooldown; retain Node >=24 and Undici 7.

@@ -1,4 +1,4 @@
-﻿# Windows work notes
+# Windows work notes
 
 Read this file whenever you're working from Windows and add new findings so the next agent can stay unblocked.
 
@@ -40,5 +40,6 @@ Future Windows gotchas belong here. Update this doc when you learn something new
 - Run `node scripts/shared-chrome-lifecycle-proof.mjs` after building for the native two-controller check. It uses a freshly initialized, signed-out profile and locally supplied pages, verifies peer CDP access after the owner exits, then checks final registry/process/endpoint cleanup. It does not prove signed-in ChatGPT concurrency or backend model identity.
 
 - After merging a dependency update that changes oxfmt, CRLF checkouts may fail format checks across otherwise unchanged files. Normalize tracked text working copies to LF and use `git -c core.autocrlf=false` for staging; verify the resulting diff contains only intended changes.
+- Synthetic attach-running proofs must isolate the child process's `LOCALAPPDATA` on Windows: browser discovery otherwise scans the real application-data tree before probing the fixture endpoint and can exhaust the proof's 20-second deadline.
 
 Provider-native conversation evidence uses the existing browser connection on Windows too. Files follow the account/directory ACLs; the POSIX owner-only file mode assertion is skipped on Windows. Capture failures leave the normal answer available.

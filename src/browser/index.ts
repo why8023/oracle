@@ -1815,8 +1815,8 @@ async function runBrowserModeInternal(
         prompt: promptText,
         result: researchResult,
         conversationUrl: lastUrl,
+        providerArtifacts: providerCapture.artifacts,
         logger,
-        additionalArtifacts: providerCapture.artifacts,
       });
       const archive = await maybeArchiveCompletedConversation({
         Runtime,
@@ -3289,8 +3289,8 @@ async function runRemoteBrowserMode(
         prompt: promptText,
         result: researchResult,
         conversationUrl: lastUrl,
+        providerArtifacts: providerCapture.artifacts,
         logger,
-        additionalArtifacts: providerCapture.artifacts,
       });
       const archive = await maybeArchiveCompletedConversation({
         Runtime,

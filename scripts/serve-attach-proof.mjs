@@ -97,6 +97,7 @@ async function prove(mode) {
   );
   const env = {
     ...process.env,
+    ...(process.platform === "win32" ? { LOCALAPPDATA: home } : {}),
     ORACLE_HOME_DIR: home,
     NO_COLOR: "1",
     NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${pathToFileURL(guard).href}`.trim(),

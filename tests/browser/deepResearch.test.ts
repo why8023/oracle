@@ -214,7 +214,7 @@ describe("Deep Research activation expression", () => {
     ["深度研究 获取详细报告", "深度研究", "添加文件等"],
     ["DeepResearch", "Deep research", "Add files and more"],
     ["Deep Research Get a detailed report", "Deep research", "Add files and more"],
-  ])("activates %s without clicking the GitHub connector", async (row, pill, plusLabel) => {
+  ])("selects %s without clicking the GitHub connector", async (row, pill, plusLabel) => {
     const expression = buildActivateDeepResearchExpressionForTest();
     let menuOpen = false;
     let activated = false;
@@ -246,7 +246,7 @@ describe("Deep Research activation expression", () => {
       }
 
       getBoundingClientRect() {
-        return { left: 10, top: 20, width: 200, height: 40 };
+        return { left: this.textContent === row ? 330 : 10, top: 20, width: 200, height: 40 };
       }
 
       closest(selector: string) {
@@ -307,7 +307,7 @@ describe("Deep Research activation expression", () => {
       },
     })) as { status?: string };
 
-    expect(result.status).toBe("trusted-click-required");
+    expect(result).toEqual({ status: "trusted-click-required", clickPoint: { x: 430, y: 40 } });
     expect(deepResearchRow.clickCount).toBe(0);
     expect(githubRow.clickCount).toBe(0);
   });

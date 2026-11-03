@@ -1324,6 +1324,7 @@ export function buildDeepResearchCompletionPollExpressionForTest(minTurnIndex = 
 function buildFindDeepResearchPillExpression(functionName = "findDeepResearchPill"): string {
   const pillLabels = JSON.stringify([DEEP_RESEARCH_PILL_LABEL, "深度研究"]);
   return `const ${functionName} = () => {
+      const labels = ${pillLabels}.map(label => label.toLowerCase());
       const isVisible = (item) => {
         const rect = item.getBoundingClientRect?.();
         if (!rect || rect.width <= 0 || rect.height <= 0) return false;
@@ -1348,7 +1349,6 @@ function buildFindDeepResearchPillExpression(functionName = "findDeepResearchPil
         }
         return roots;
       };
-      const labels = ${pillLabels}.map(label => label.toLowerCase());
       const selectors = [
         '.__composer-pill-composite',
         '.__composer-pill',
